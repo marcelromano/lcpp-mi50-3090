@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "cola.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -353,12 +354,6 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
-#ifdef GGML_EXP_MMVQ_V5
-        // sm_86 (GENERIC): 2 warps for the decode/MTP-verify shapes (ncols 1..4)
-        if (ncols_dst >= 1 && ncols_dst <= 4) {
-            return 2;
-        }
-#endif // GGML_EXP_MMVQ_V5
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -374,6 +369,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     } else if (table_id == MMVQ_PARAMETERS_GCN) {
+#ifdef GGML_EXP_GCN_MMVQ_GEOM
+        // gfx906: one wave per block for the decode/MTP-verify shapes (more blocks in flight)
+        if (ncols_dst <= 4) {
+            return 1;
+        }
+#endif
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -464,12 +465,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-#ifdef GGML_EXP_MMVQ_V5
-    if (table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst == 1) {
-        return 2; // v5: 2 rows per block also for ncols == 1
-    }
-#endif // GGML_EXP_MMVQ_V5
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+#ifdef GGML_EXP_GCN_MMVQ_GEOM
+        if (table_id == MMVQ_PARAMETERS_GCN && ncols_dst == 1 && !small_k) {
+            return 2;
+        }
+#endif
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -896,7 +897,7 @@ static __device__ __forceinline__ float mmvq_gcn2_group_sum(float x, const int l
     return x;
 }
 
-static constexpr __device__ vec_dot_q_cuda_t mmvq_gcn2_get_vec_dot(ggml_type type) {
+static constexpr __device__ vec_dot_q_cuda_t mmvq_gcn2_get_vec_dot(ggml_type type, bool lut = false) {
 #if !defined(GGML_EXP_MMVQ_GCN2_NOWIDE)
     if (type == GGML_TYPE_IQ4_XS) {
         return vec_dot_iq4_xs_q8_1_gcn2;
@@ -905,9 +906,19 @@ static constexpr __device__ vec_dot_q_cuda_t mmvq_gcn2_get_vec_dot(ggml_type typ
 #if defined(GGML_EXP_MMVQ_GCN2_IQ3V2) && !defined(GGML_EXP_MMVQ_GCN2_V2_NOVEC)
     if (type == GGML_TYPE_IQ3_XXS) { return vec_dot_iq3_xxs_q8_1_v2; }
     if (type == GGML_TYPE_IQ3_S)   { return vec_dot_iq3_s_q8_1_v2;   }
-    if (type == GGML_TYPE_IQ2_XXS) { return vec_dot_iq2_xxs_q8_1_v2; }
-    if (type == GGML_TYPE_IQ2_XS)  { return vec_dot_iq2_xs_q8_1_v2;  }
-    if (type == GGML_TYPE_IQ2_S)   { return vec_dot_iq2_s_q8_1_v2;   }
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+    if (type == GGML_TYPE_IQ2_XXS) { return lut ? vec_dot_iq2_xxs_q8_1_v2<true> : vec_dot_iq2_xxs_q8_1_v2<false>; }
+    if (type == GGML_TYPE_IQ2_XS)  { return lut ? vec_dot_iq2_xs_q8_1_v2<true>  : vec_dot_iq2_xs_q8_1_v2<false>;  }
+    if (type == GGML_TYPE_IQ2_S)   { return lut ? vec_dot_iq2_s_q8_1_v2<true>   : vec_dot_iq2_s_q8_1_v2<false>;   }
+#else
+    GGML_UNUSED(lut);
+    if (type == GGML_TYPE_IQ2_XXS) { return vec_dot_iq2_xxs_q8_1_v2<>; }
+    if (type == GGML_TYPE_IQ2_XS)  { return vec_dot_iq2_xs_q8_1_v2<>;  }
+    if (type == GGML_TYPE_IQ2_S)   { return vec_dot_iq2_s_q8_1_v2<>;   }
+#endif
+#endif
+#if defined(GGML_EXP_MMVQ_DEC_Q2K)
+    if (type == GGML_TYPE_Q2_K)    { return vec_dot_q2_K_q8_1_v2;    }
 #endif
     return get_vec_dot_q_cuda(type);
 }
@@ -943,6 +954,33 @@ static_assert(GGML_EXP_MMVQ_GCN2_V2_RPL == 1 || GGML_EXP_MMVQ_GCN2_V2_RPL == 2, 
 #define MMVQ_GCN2V2_ATTR
 #endif
 
+// ---------------------------------------------------------------------------------------------
+// local (alvo 2, decode n=1): knobs GGML_EXP_MMVQ_DEC_* for the dedicated kernel (all off unless defined):
+//   _ADDR   row base pointers hoisted out of the kbx loop (no v_mad_i64_i32 / 64-bit re-add per row per iteration)
+//   _MUL24  scale products on v_mul_i32_i24 (vecdotq.cuh, MMVQ_V2_MUL)
+//   _Q2K    Q2_K vec_dot v2 (vecdotq.cuh, vec_dot_q2_K_q8_1_v2)
+//   _SGN2   conflict-free nibble sign tables (vecdotq.cuh, MMVQ_V2_SGN7/8)
+//   _NW=n   n waves per block (LDS types only): tables filled once per block, 1/n of the fill per wave; with
+//           GGML_EXP_MMVQ_GCN2_IQ2S_LDS the IQ2_S grid costs 10 KiB per n waves instead of per wave
+// ---------------------------------------------------------------------------------------------
+#ifndef GGML_EXP_MMVQ_DEC_WPE
+#define GGML_EXP_MMVQ_DEC_WPE 1   // 2nd __launch_bounds__ argument = min waves per EU on HIP (amdgpu-waves-per-eu): caps VGPRs at 256/WPE
+#endif
+#ifndef GGML_EXP_MMVQ_DEC_NW
+#define GGML_EXP_MMVQ_DEC_NW 1
+#endif
+static_assert(GGML_EXP_MMVQ_DEC_NW >= 1 && GGML_EXP_MMVQ_DEC_NW <= 8, "DEC_NW must be 1..8");
+
+template <ggml_type type>
+static constexpr __host__ __device__ int mmvq_dec_blk_bytes() {
+    return type == GGML_TYPE_Q2_K    ? (int) sizeof(block_q2_K)    :
+           type == GGML_TYPE_IQ2_XXS ? (int) sizeof(block_iq2_xxs) :
+           type == GGML_TYPE_IQ2_XS  ? (int) sizeof(block_iq2_xs)  :
+           type == GGML_TYPE_IQ2_S   ? (int) sizeof(block_iq2_s)   :
+           type == GGML_TYPE_IQ3_XXS ? (int) sizeof(block_iq3_xxs) :
+           type == GGML_TYPE_IQ3_S   ? (int) sizeof(block_iq3_s)   : 0;
+}
+
 // i-quants whose grid/sign tables live in LDS and are filled by the prologue
 static constexpr __host__ __device__ bool mmvq_gcn2v2_lds_type(ggml_type type) {
     return type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_XXS ||
@@ -954,6 +992,21 @@ static constexpr __host__ __device__ bool mmvq_gcn2v2_type(ggml_type type) {
     return mmvq_gcn2v2_lds_type(type) || type == GGML_TYPE_Q2_K;
 }
 
+// perm-LUT sign/magnitude path (GGML_EXP_MMVQ_DEC_IQ2LUT): IQ2_* and ncols_dst == 1 only
+static constexpr __host__ __device__ bool mmvq_dec_lut(ggml_type type, int ncols_dst) {
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+    return ncols_dst == 1 && (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S);
+#else
+    GGML_UNUSED(type); GGML_UNUSED(ncols_dst);
+    return false;
+#endif
+}
+
+// waves per block of the dedicated kernel
+static constexpr __host__ __device__ int mmvq_dec_nwv(ggml_type type) {
+    return mmvq_gcn2v2_lds_type(type) ? GGML_EXP_MMVQ_DEC_NW : 1;
+}
+
 static constexpr __host__ __device__ int mmvq_gcn2v2_bit(ggml_type type) {
     return type == GGML_TYPE_IQ3_XXS ? 1 : type == GGML_TYPE_IQ3_S ? 2 : type == GGML_TYPE_IQ2_S ? 4 :
            type == GGML_TYPE_IQ2_XS  ? 8 : type == GGML_TYPE_IQ2_XXS ? 16 : type == GGML_TYPE_Q2_K ? 32 : 0;
@@ -961,20 +1014,44 @@ static constexpr __host__ __device__ int mmvq_gcn2v2_bit(ggml_type type) {
 
 // Fill sign table (+ grid when with_grid) of `type` in LDS. t0 = this thread's index, nt = number of threads that cooperate.
 // The caller synchronizes (wave fence for 1-wave blocks, __syncthreads otherwise).
-template <ggml_type type, bool with_grid>
+template <ggml_type type, bool with_grid, bool lut = false>
 static __device__ __forceinline__ void mmvq_gcn2v2_fill_lds(const int t0, const int nt) {
-    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS) {
+#if defined(GGML_EXP_MMVQ_DEC_SGN2)
+    if constexpr (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+                  type == GGML_TYPE_IQ3_S   || type == GGML_TYPE_IQ2_S) {
+        for (int i = t0; i < 32; i += nt) {
+            mmvq_v2_nib_lds[i] = mmvq_v2_nib_mask(i >> 1);
+        }
+    }
+#else
+    if constexpr (type == GGML_TYPE_IQ3_XXS || (!lut && (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS))) {
 #pragma unroll
         for (int i = t0; i < 128; i += nt) {
             const uint32_t p = __popc(i) & 1;
             mmvq_v2_sgn7_lds[i] = mmvq_v2_sign_masks(i ^ (p << 7));
         }
-    } else if constexpr (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S) {
+    } else if constexpr (type == GGML_TYPE_IQ3_S || (!lut && type == GGML_TYPE_IQ2_S)) {
 #pragma unroll
         for (int i = t0; i < 256; i += nt) {
             mmvq_v2_sgn8_lds[i] = mmvq_v2_sign_masks(i);
         }
     }
+#endif // defined(GGML_EXP_MMVQ_DEC_SGN2)
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+    if constexpr (!lut) {
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        for (int i = t0; i < 256; i += nt)  { const uint2 g = ((const uint2 *) iq2xxs_grid)[i]; mmvq_v2_iq2xxs_sym[i] = make_uint2(mmvq_v2_sym4(g.x), mmvq_v2_sym4(g.y)); }
+    } else if constexpr (type == GGML_TYPE_IQ2_XS) {
+        for (int i = t0; i < 512; i += nt)  { const uint2 g = ((const uint2 *) iq2xs_grid)[i];  mmvq_v2_iq2xs_sym[i]  = make_uint2(mmvq_v2_sym4(g.x), mmvq_v2_sym4(g.y)); }
+    } else if constexpr (type == GGML_TYPE_IQ2_S) {
+        for (int i = t0; i < 1024; i += nt) { const uint2 g = ((const uint2 *) iq2s_grid)[i];   mmvq_v2_iq2s_sym[i]   = make_uint2(mmvq_v2_sym4(g.x), mmvq_v2_sym4(g.y)); }
+    }
+#endif
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+    if constexpr (lut && with_grid && (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S)) {
+        return; // the symbol table replaces the grid in LDS
+    }
+#endif
     if constexpr (with_grid) {
         if constexpr (type == GGML_TYPE_IQ3_XXS) {
 #pragma unroll
@@ -1327,7 +1404,7 @@ static __global__ void mul_mat_vec_q_moe_gcn2(
 //  * IQ grids and sign tables are filled by a wave-only prologue issued right after the ids loads.
 // ---------------------------------------------------------------------------------------------
 template <ggml_type type, int ncols_dst, bool has_fusion, int rpl>
-__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1) MMVQ_GCN2V2_ATTR
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmvq_dec_nwv(type), GGML_EXP_MMVQ_DEC_WPE) MMVQ_GCN2V2_ATTR
 static __global__ void mul_mat_vec_q_gcn2v2(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1348,7 +1425,10 @@ static __global__ void mul_mat_vec_q_gcn2v2(
     static_assert(lanes_per_blk >= 8 && (lanes_per_blk & (lanes_per_blk - 1)) == 0, "lanes_per_blk must be a power of two >= 8");
     constexpr int bpi = warp_size / lanes_per_blk; // superblocks per iteration of the wave
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = mmvq_gcn2_get_vec_dot(type);
+    // local: the perm-LUT sign path halves the LDS lookups but costs VALU; it only pays for n=1 (n>=2 shares the lookups among
+    // the columns and is VALU-bound), so n>=2 keeps the table path
+    constexpr bool dec_lut = mmvq_dec_lut(type, ncols_dst);
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = mmvq_gcn2_get_vec_dot(type, dec_lut);
 
     const int lane             = threadIdx.x;
     const int blocks_per_row_x = ncols_x / qk;
@@ -1368,9 +1448,15 @@ static __global__ void mul_mat_vec_q_gcn2v2(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
+    constexpr int nwv = mmvq_dec_nwv(type);
     if constexpr (mmvq_gcn2v2_lds_type(type)) {
-        mmvq_gcn2v2_fill_lds<type, true>(lane, warp_size);
-        mmvq_gcn2v2_wave_sync();
+        if constexpr (nwv > 1) {
+            mmvq_gcn2v2_fill_lds<type, true, dec_lut>(threadIdx.y*warp_size + lane, warp_size*nwv);
+            __syncthreads();
+        } else {
+            mmvq_gcn2v2_fill_lds<type, true, dec_lut>(lane, warp_size);
+            mmvq_gcn2v2_wave_sync();
+        }
     }
 
     bool use_gate = false;
@@ -1399,7 +1485,8 @@ static __global__ void mul_mat_vec_q_gcn2v2(
 
     float * dst_c = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst;
 
-    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+    const int wave_y = nwv > 1 ? __builtin_amdgcn_readfirstlane((int) threadIdx.y) : 0; // wave-uniform: keeps rows in SGPRs
+    for (int tile = blockIdx.x*nwv + wave_y; tile < ntiles; tile += gridDim.x*nwv) {
         int  rows[rpl];
         int  rowc[rpl];
         bool rvalid[rpl];
@@ -1409,6 +1496,22 @@ static __global__ void mul_mat_vec_q_gcn2v2(
             rvalid[r] = uint32_t(rows[r]) < nrows_x;
             rowc[r]   = rvalid[r] ? rows[r] : int(nrows_x) - 1; // tail row recomputes the last row, result discarded
         }
+#if defined(GGML_EXP_MMVQ_DEC_ADDR)
+        // local: row base pointers once per tile; the loop then only adds kbx (the original recomputed
+        // kbx_offset + rowc*stride_row_x + kbx -> v_mad_i64_i32 + 64-bit adds per row per iteration)
+        // and the pointers advance by bpi blocks per iteration (vec_dot gets kbx = 0 -> constant offsets from one base)
+        const char * rowp[rpl];
+        [[maybe_unused]] const char * rowp_g[rpl];
+#pragma unroll
+        for (int r = 0; r < rpl; ++r) {
+            const size_t off = ((size_t) (uint32_t) (kbx_offset + rowc[r]*stride_row_x) + (size_t) kbx_lane) * mmvq_dec_blk_bytes<type>();
+            rowp[r] = (const char *) vx + off;
+            if constexpr (has_fusion) {
+                rowp_g[r] = (const char *) vgate + off;
+            }
+        }
+        const int kbx0 = 0;
+#endif
 
         [[maybe_unused]] float x_biases[ncols_dst][rpl]    = {{0.0f}};
         [[maybe_unused]] float gate_biases[ncols_dst][rpl] = {{0.0f}};
@@ -1444,13 +1547,43 @@ static __global__ void mul_mat_vec_q_gcn2v2(
         float tmp[ncols_dst][rpl] = {{0.0f}};
         float tmp_gate[ncols_dst][rpl] = {{0.0f}};
 
+#if defined(GGML_EXP_MMVQ_DEC_UNROLL) && GGML_EXP_MMVQ_DEC_UNROLL == 2
+#pragma unroll 2
+#elif defined(GGML_EXP_MMVQ_DEC_UNROLL) && GGML_EXP_MMVQ_DEC_UNROLL == 3
+#pragma unroll 3
+#endif
         for (int kbx = kbx_lane; kbx < blocks_per_row_x; kbx += bpi) {
             const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
+#if defined(GGML_EXP_MMVQ_REUSE3)
+            if constexpr (ncols_dst == 3 && !has_fusion && (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS)) {
+#pragma unroll
+                for (int r=0;r<rpl;++r) {
+                    float out[3];
+                    if constexpr (type == GGML_TYPE_IQ3_XXS) vec_dot_iq3_xxs_q8_1_v2_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+                    else if constexpr (type == GGML_TYPE_IQ3_S) vec_dot_iq3_s_q8_1_v2_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+                    else if constexpr (type == GGML_TYPE_IQ2_XXS) vec_dot_iq2_xxs_q8_1_v2_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+                    else if constexpr (type == GGML_TYPE_IQ2_XS) vec_dot_iq2_xs_q8_1_v2_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+                    else if constexpr (type == GGML_TYPE_IQ2_S) vec_dot_iq2_s_q8_1_v2_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+                    else if constexpr (type == GGML_TYPE_Q2_K) vec_dot_q2_K_q8_1_3(vx, &y[kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs, stride_col_y, out);
+#pragma unroll
+                    for(int j=0;j<3;++j) tmp[j][r] += out[j];
+                }
+            } else
+#endif
+            {
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
                 for (int r = 0; r < rpl; ++r) {
+#if defined(GGML_EXP_MMVQ_DEC_ADDR)
+                    tmp[j][r] += vec_dot_q_cuda(rowp[r], &y[j*stride_col_y + kby], kbx0, kqs);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][r] += vec_dot_q_cuda(rowp_g[r], &y[j*stride_col_y + kby], kbx0, kqs);
+                        }
+                    }
+#else
                     tmp[j][r] += vec_dot_q_cuda(
                         vx, &y[j*stride_col_y + kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs);
                     if constexpr (has_fusion) {
@@ -1459,8 +1592,19 @@ static __global__ void mul_mat_vec_q_gcn2v2(
                                 vgate, &y[j*stride_col_y + kby], kbx_offset + rowc[r]*stride_row_x + kbx, kqs);
                         }
                     }
+#endif
                 }
             }
+            }
+#if defined(GGML_EXP_MMVQ_DEC_ADDR)
+#pragma unroll
+            for (int r = 0; r < rpl; ++r) {
+                rowp[r] += bpi * mmvq_dec_blk_bytes<type>();
+                if constexpr (has_fusion) {
+                    rowp_g[r] += bpi * mmvq_dec_blk_bytes<type>();
+                }
+            }
+#endif
         }
 
 #pragma unroll
@@ -1687,14 +1831,15 @@ static void mul_mat_vec_q_gcn2_switch(
         if (lpr_log2 == 6 && !(ids != nullptr && ncols_dst > 1)) {
             // full-wave rows: dedicated kernel (constexpr geometry, persistent tiles)
             constexpr int rpl2 = GGML_EXP_MMVQ_GCN2_V2_RPL;
+            constexpr int nwv2 = mmvq_dec_nwv(type);
             const int64_t ntiles = (nrows_x + rpl2 - 1) / rpl2;
-            int64_t nb = ntiles;
+            int64_t nb = (ntiles + nwv2 - 1) / nwv2;
             const int bpc = mmvq_gcn2v2_bpc();
             if (bpc > 0) {
-                nb = std::min<int64_t>(ntiles, (int64_t) bpc * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
+                nb = std::min<int64_t>(nb, (int64_t) bpc * ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
             }
             const dim3 grid2(nb, nchannels_dst, nsamples_dst);
-            const dim3 block2(warp_size, 1, 1);
+            const dim3 block2(warp_size, nwv2, 1);
 
 #define MMVQ_GCN2V2_CASE(NC) \
             case NC: \
@@ -2200,6 +2345,11 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 #ifdef GGML_EXP_Q8_SHARE
+#ifdef GGML_EXP_COLA
+    if (src1_q8_1_pre == nullptr && !ids) {
+        src1_q8_1_pre = ggml_cuda_cola_pending_q8(ctx, src1);
+    }
+#endif
     ggml_cuda_pool_alloc<char> src1_q8_1_own(ctx.pool());
     const char * src1_q8_1 = src1_q8_1_pre;
     if (src1_q8_1 == nullptr) {
@@ -2264,14 +2414,22 @@ void ggml_cuda_mul_mat_vec_q_shared_src1(ggml_backend_cuda_context & ctx, ggml_t
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
 
     // same buffer size and quantize call as the non-shared path in ggml_cuda_mul_mat_vec_q
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), mm[0]->src[0]->type, ne10,
-        src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
-        ne10_padded, ne11, ne12, ne13, ctx.stream());
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * q8_ptr = nullptr;
+#ifdef GGML_EXP_COLA
+    q8_ptr = ggml_cuda_cola_pending_q8(ctx, src1);
+#endif
+    if (q8_ptr == nullptr) {
+        src1_q8_1.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), mm[0]->src[0]->type, ne10,
+            src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+            ne10_padded, ne11, ne12, ne13, ctx.stream());
+        q8_ptr = src1_q8_1.get();
+    }
 
     for (int k = 0; k < n; ++k) {
         GGML_ASSERT(mm[k]->src[1] == src1);
-        ggml_cuda_mul_mat_vec_q(ctx, mm[k]->src[0], src1, nullptr, mm[k], nullptr, src1_q8_1.get());
+        ggml_cuda_mul_mat_vec_q(ctx, mm[k]->src[0], src1, nullptr, mm[k], nullptr, q8_ptr);
     }
 }
 #endif // GGML_EXP_Q8_SHARE

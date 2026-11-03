@@ -876,12 +876,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-#ifdef GGML_EXP_MMVF_BF16_N8
-                    // verification batch of speculative decoding (n = 2..8): cuBLAS bf16 gemm + 2 converts is slower
-                    return src0_small && ne11 <= 8;
-#else
                     return src0_small && ne11 == 1;
-#endif // GGML_EXP_MMVF_BF16_N8
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;

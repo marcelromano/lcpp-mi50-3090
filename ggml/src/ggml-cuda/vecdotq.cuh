@@ -1477,6 +1477,58 @@ static __device__ __forceinline__ int mmvq_v2_apply_sign(const uint32_t g, const
     return (int) ((g ^ m) + (m & 0x01010101u));
 }
 
+#if defined(GGML_EXP_MMVQ_DEC_SGN2)
+// local (alvo 2): sign masks from a 16-entry nibble table instead of the 128/256-entry uint2 tables.
+// A 16-entry b32 table replicated twice (word = 2*nibble + replica, replica = lane & 1) puts every distinct (entry, replica)
+// pair in its own LDS bank: any 32 lanes of a ds_read_b32 either hit different banks or the same address (broadcast), so the
+// lookup is conflict-free. The random 7/8-bit lookup into the uint2 tables conflicts ~3x (16 lanes per ds_read_b64 clock).
+// Costs 2 ds_read_b32 + a few VALU per 8 weights instead of 1 ds_read_b64.
+static __shared__ uint32_t mmvq_v2_nib_lds[32];
+
+static __device__ __forceinline__ uint32_t mmvq_v2_nib_mask(const uint32_t n) { // n in [0,15]
+    return __vcmpne4((n * 0x01010101u) & 0x08040201u, 0);
+}
+
+static __device__ __forceinline__ uint2 mmvq_v2_sgn_nib(const uint32_t sb) { // sb: 8-bit sign byte
+    const uint32_t r = threadIdx.x & 1;
+    return make_uint2(mmvq_v2_nib_lds[((sb & 0x0F) << 1) | r], mmvq_v2_nib_lds[((sb >> 3) & 0x1E) | r]);
+}
+#define MMVQ_V2_SGN8(sb) mmvq_v2_sgn_nib((uint32_t) (sb))
+#define MMVQ_V2_SGN7(s7) mmvq_v2_sgn_nib((uint32_t) (s7) | (((uint32_t) __popc((uint32_t) (s7)) & 1u) << 7))
+#else
+#define MMVQ_V2_SGN8(sb) mmvq_v2_sgn8_lds[(sb)]
+#define MMVQ_V2_SGN7(s7) mmvq_v2_sgn7_lds[(s7)]
+#endif // defined(GGML_EXP_MMVQ_DEC_SGN2)
+
+#if defined(GGML_EXP_MMVQ_DEC_MUL24)
+// local: scale products on the full-rate 24-bit multiplier (v_mul_i32_i24) instead of the quarter-rate v_mul_lo_u32.
+// |sumi| <= 32*62*127 < 2^23 and the scales are <= 63, so the 24-bit product is exact (bit-exact vs the 32-bit product).
+#define MMVQ_V2_MUL(a, b) __mul24((a), (b))
+#else
+#define MMVQ_V2_MUL(a, b) ((a) * (b))
+#endif
+
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+// local: IQ2_XXS / IQ2_XS / IQ2_S have only 3 magnitudes per weight (8, 25, 43). The LDS table keeps the grid as SYMBOL bytes
+// (0,1,2) and the sign is applied by a v_perm_b32 used as an 8-entry byte LUT {8,25,43,0,-8,-25,-43,0}: selector byte =
+// symbol | 4*negative. One ds_read_b64 (symbols) + 4 VALU per 8 weights replace ds_read_b64 (grid) + ds_read_b64 (signs)
+// + 4 VALU: half of the random LDS lookups (the LDS-bound part of these kernels, see local notes) for ~+2..+5 VALU per 8 weights.
+static __shared__ uint2 mmvq_v2_iq2xxs_sym[256];
+static __shared__ uint2 mmvq_v2_iq2xs_sym[512];
+static __shared__ uint2 mmvq_v2_iq2s_sym[1024];
+
+static __device__ __forceinline__ uint32_t mmvq_v2_sym4(const uint32_t x) { // 4 grid bytes {8,25,43} -> {0,1,2}
+    const uint32_t t = (x >> 3) & 0x1F1F1F1Fu;                              // {1,3,5}
+    return ((t - 0x01010101u) >> 1) & 0x7F7F7F7Fu;
+}
+
+static __device__ __forceinline__ uint32_t mmvq_v2_lut_sign(const uint32_t sym, const uint32_t nib) {
+    // spread the 4 sign bits of `nib` to bit 2 of each byte: bit i -> 8*i+2 (copies at shifts 2,9,16,23 do not overlap for 4 bits)
+    const uint32_t sel = sym | (__umul24(nib, 0x00810204u) & 0x04040404u);
+    return __builtin_amdgcn_perm(0x00D5E7F8u /* bytes 4..7: -8,-25,-43,0 */, 0x002B1908u /* bytes 0..3: 8,25,43,0 */, sel);
+}
+#endif // defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+
 static __device__ __forceinline__ uint2 mmvq_v2_ld8(const void * p) {
 #if !defined(GGML_EXP_MMVQ_GCN2_V2_NOWIDE_W)
     const mmvq_v2_v2u v = *(const mmvq_v2_v2u *) p;
@@ -1530,7 +1582,7 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1_v2(
         const uint32_t w = l0 < 4 ? qw.x : qw.y;
         const int      k = (l0 & 2);
         const uint2 grid = make_uint2(IQ3XXS_GRID_SRC[MMVQ_V2_B(w, k)], IQ3XXS_GRID_SRC[MMVQ_V2_B(w, k + 1)]);
-        const uint2 m    = mmvq_v2_sgn7_lds[(aux32 >> (7*l0/2)) & 0x7F];
+        const uint2 m    = MMVQ_V2_SGN7((aux32 >> (7*l0/2)) & 0x7F);
         sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[l0 + 0], sumi);
         sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[l0 + 1], sumi);
     }
@@ -1561,17 +1613,18 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_v2(
         const uint2 grid = make_uint2(
             IQ3S_GRID_SRC[MMVQ_V2_B(w, k)     | ((qh << (8 - l0)) & 0x100)],
             IQ3S_GRID_SRC[MMVQ_V2_B(w, k + 1) | ((qh << (7 - l0)) & 0x100)]);
-        const uint2 m = mmvq_v2_sgn8_lds[MMVQ_V2_B(sp, l0/2)];
+        const uint2 m = MMVQ_V2_SGN8(MMVQ_V2_B(sp, l0/2));
         sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[l0 + 0], sumi);
         sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[l0 + 1], sumi);
     }
 
-    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi = MMVQ_V2_MUL(sumi, 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F));
 
     const float d = __half2float(bq3->d) * __low2float(bq8->ds);
     return d * sumi;
 }
 
+template <bool LUT = false>
 static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_v2(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1586,18 +1639,31 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_v2(
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid = ((const uint2 *) IQ2XXS_GRID_SRC)[MMVQ_V2_B(qa.x, k0/2)];
-        const uint2 m    = mmvq_v2_sgn7_lds[(aux32 >> (7*k0/2)) & 0x7F];
-        sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[k0 + 0], sumi);
-        sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[k0 + 1], sumi);
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+        if constexpr (LUT) {
+            const uint2    sym = mmvq_v2_iq2xxs_sym[MMVQ_V2_B(qa.x, k0/2)];
+            const uint32_t s7  = (aux32 >> (7*k0/2)) & 0x7F;
+            const uint32_t nlo = s7 & 0xF;
+            const uint32_t nhi = ((s7 >> 4) & 7) | ((__popc(s7) & 1) << 3);
+            sumi = ggml_cuda_dp4a((int) mmvq_v2_lut_sign(sym.x, nlo), y[k0 + 0], sumi);
+            sumi = ggml_cuda_dp4a((int) mmvq_v2_lut_sign(sym.y, nhi), y[k0 + 1], sumi);
+        } else
+#endif
+        {
+            const uint2 grid = ((const uint2 *) IQ2XXS_GRID_SRC)[MMVQ_V2_B(qa.x, k0/2)];
+            const uint2 m    = MMVQ_V2_SGN7((aux32 >> (7*k0/2)) & 0x7F);
+            sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[k0 + 0], sumi);
+            sumi = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[k0 + 1], sumi);
+        }
     }
 
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
-    sumi = sumi * ls / 8;           // (sumi * scale + sumi / 2) / 4
+    sumi = MMVQ_V2_MUL(sumi, ls) / 8;           // (sumi * scale + sumi / 2) / 4
     const float d = __half2float(bq2->d) * __low2float(bq8->ds);
     return d * sumi;
 }
 
+template <bool LUT = false>
 static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_v2(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1616,10 +1682,23 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_v2(
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint32_t w = l0 < 4 ? qw.x : qw.y;
         const uint32_t q = (w >> (16*((l0 >> 1) & 1))) & 0xFFFFu;   // q2[l0/2]
-        const uint2 grid = ((const uint2 *) IQ2XS_GRID_SRC)[q & 0x1FF];
-        const uint2 m    = mmvq_v2_sgn7_lds[q >> 9];
-        const int grid_l = mmvq_v2_apply_sign(grid.x, m.x);
-        const int grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        int grid_l, grid_h;
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+        if constexpr (LUT) {
+            const uint2    sym = mmvq_v2_iq2xs_sym[q & 0x1FF];
+            const uint32_t s7  = q >> 9;
+            const uint32_t nlo = s7 & 0xF;
+            const uint32_t nhi = ((s7 >> 4) & 7) | ((__popc(s7) & 1) << 3);
+            grid_l = (int) mmvq_v2_lut_sign(sym.x, nlo);
+            grid_h = (int) mmvq_v2_lut_sign(sym.y, nhi);
+        } else
+#endif
+        {
+            const uint2 grid = ((const uint2 *) IQ2XS_GRID_SRC)[q & 0x1FF];
+            const uint2 m    = MMVQ_V2_SGN7(q >> 9);
+            grid_l = mmvq_v2_apply_sign(grid.x, m.x);
+            grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        }
         if (l0 < 4) {
             sumi0 = ggml_cuda_dp4a(grid_l, y[l0 + 0], sumi0);
             sumi0 = ggml_cuda_dp4a(grid_h, y[l0 + 1], sumi0);
@@ -1628,11 +1707,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1_v2(
             sumi1 = ggml_cuda_dp4a(grid_h, y[l0 + 1], sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const int sumi = (MMVQ_V2_MUL(sumi0, ls0) + MMVQ_V2_MUL(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
     const float d = __half2float(bq2->d) * __low2float(bq8->ds);
     return d * sumi;
 }
 
+template <bool LUT = false>
 static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_v2(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -1651,10 +1731,21 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_v2(
     int sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid = ((const uint2 *) IQ2S_GRID_SRC)[MMVQ_V2_B(qsw, l0/2) | ((qh << (8 - l0)) & 0x300)];
-        const uint2 m    = mmvq_v2_sgn8_lds[MMVQ_V2_B(sp, l0/2)];
-        const int grid_l = mmvq_v2_apply_sign(grid.x, m.x);
-        const int grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        int grid_l, grid_h;
+#if defined(GGML_EXP_MMVQ_DEC_IQ2LUT)
+        if constexpr (LUT) {
+            const uint2    sym = mmvq_v2_iq2s_sym[MMVQ_V2_B(qsw, l0/2) | ((qh << (8 - l0)) & 0x300)];
+            const uint32_t sb  = MMVQ_V2_B(sp, l0/2);
+            grid_l = (int) mmvq_v2_lut_sign(sym.x, sb & 0xF);
+            grid_h = (int) mmvq_v2_lut_sign(sym.y, sb >> 4);
+        } else
+#endif
+        {
+            const uint2 grid = ((const uint2 *) IQ2S_GRID_SRC)[MMVQ_V2_B(qsw, l0/2) | ((qh << (8 - l0)) & 0x300)];
+            const uint2 m    = MMVQ_V2_SGN8(MMVQ_V2_B(sp, l0/2));
+            grid_l = mmvq_v2_apply_sign(grid.x, m.x);
+            grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        }
         if (l0 < 4) {
             sumi0 = ggml_cuda_dp4a(grid_l, y[l0 + 0], sumi0);
             sumi0 = ggml_cuda_dp4a(grid_h, y[l0 + 1], sumi0);
@@ -1663,10 +1754,275 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_v2(
             sumi1 = ggml_cuda_dp4a(grid_h, y[l0 + 1], sumi1);
         }
     }
-    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+    const int sumi = (MMVQ_V2_MUL(sumi0, ls0) + MMVQ_V2_MUL(sumi1, ls1) + (sumi0 + sumi1)/2)/4;
 
     const float d = __half2float(bq2->d) * __low2float(bq8->ds);
     return d * sumi;
 }
+
+#if defined(GGML_EXP_MMVQ_DEC_Q2K)
+// local: Q2_K vec_dot for the gcn2 kernels. Same integer arithmetic as vec_dot_q2_K_q8_1 (bit-exact per lane), but
+//  * the four scale bytes (at +0,+2,+4,+6 of the lane's scale window) come from two dword loads instead of four ubyte loads;
+//  * dp4a * (sc & 0xF) uses the full-rate 24-bit multiplier (the original int product is v_mul_lo_u32, quarter rate: it
+//    was 41% of the issue time of the n=1 loop);
+//  * the 4x(sc >> 4) broadcast is a single v_perm_b32 instead of shift/or/shift/or.
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_v2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
+
+    const int bq8_offset   = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2); // 0, 1, 8 or 9
+
+    const uint32_t sw0 = get_int_b4(bq2_K->scales, (scale_offset >> 2) + 0);
+    const uint32_t sw1 = get_int_b4(bq2_K->scales, (scale_offset >> 2) + 1);
+    const int sh = 8*(scale_offset & 3);
+
+    const int v = get_int_b4(bq2_K->qs, iqs);
+    int   u[QR2_K];
+    float d8[QR2_K];
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const uint32_t sw = (i & 2) ? sw1 : sw0;
+        const int sc = (sw >> (sh + 16*(i & 1))) & 0xFF;
+        const int vi = (v >> (2*i)) & 0x03030303;
+
+        sumf_d += d8[i] * (MMVQ_V2_MUL(ggml_cuda_dp4a(vi, u[i], 0), sc & 0xF));
+
+        const int m = (int) __builtin_amdgcn_perm(0u, (uint32_t) (sc >> 4), 0u); // v_perm_b32: 4x (sc >> 4) (__byte_perm lowers to a quarter-rate v_mul_lo_u32 by 0x01010101)
+        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0);
+    }
+
+    const float2 dm2f = __half22float2(bq2_K->dm);
+    return dm2f.x*sumf_d - dm2f.y*sumf_m;
+}
+#endif // defined(GGML_EXP_MMVQ_DEC_Q2K)
+
+#if defined(GGML_EXP_MMVQ_REUSE3)
+static __device__ __forceinline__ void vec_dot_iq3_xxs_q8_1_v2_3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int stride, float (&out)[3]) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+
+    const uint2    qw    = mmvq_v2_ld8(bq3->qs + 4*iqs);          // q3[0..7] grid indices
+    const uint32_t aux32 = mmvq_v2_ld4(bq3->qs + 64 + 2*iqs);     // 4 x 7 sign bits + 4-bit scale
+    int y[3][8];
+#pragma unroll
+    for (int j=0;j<3;++j) mmvq_v2_ld_y(bq8_1+j*stride+iqs/2, y[j]);
+
+    int sumi[3] = {0,0,0};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t w = l0 < 4 ? qw.x : qw.y;
+        const int      k = (l0 & 2);
+        const uint2 grid = make_uint2(IQ3XXS_GRID_SRC[MMVQ_V2_B(w, k)], IQ3XXS_GRID_SRC[MMVQ_V2_B(w, k + 1)]);
+        const uint2 m    = mmvq_v2_sgn7_lds[(aux32 >> (7*l0/2)) & 0x7F];
+#pragma unroll
+        for (int j=0;j<3;++j) {
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[j][l0 + 0], sumi[j]);
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[j][l0 + 1], sumi[j]);
+        }
+    }
+
+#pragma unroll
+    for (int j=0;j<3;++j) {
+    const int ls = aux32 >> 28;
+    sumi[j] = (__mul24(ls, sumi[j]) + sumi[j]/2)/2;
+    const float d = __half2float(bq3->d) * __low2float((bq8_1+j*stride+iqs/2)->ds);
+    out[j] = d * sumi[j];    }
+}
+
+static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_v2_3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int stride, float (&out)[3]) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+
+    const uint2    qw = mmvq_v2_ld8(bq3->qs + 4*iqs);
+    const int      qh = bq3->qh[iqs/2];
+    const uint32_t sp = mmvq_v2_ld4(bq3->signs + 2*iqs);          // get_int_b2(signs, iqs/2)
+    int y[3][8];
+#pragma unroll
+    for (int j=0;j<3;++j) mmvq_v2_ld_y(bq8_1+j*stride+iqs/2, y[j]);
+
+    int sumi[3] = {0,0,0};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t w = l0 < 4 ? qw.x : qw.y;
+        const int      k = (l0 & 2);
+        const uint2 grid = make_uint2(
+            IQ3S_GRID_SRC[MMVQ_V2_B(w, k)     | ((qh << (8 - l0)) & 0x100)],
+            IQ3S_GRID_SRC[MMVQ_V2_B(w, k + 1) | ((qh << (7 - l0)) & 0x100)]);
+        const uint2 m = mmvq_v2_sgn8_lds[MMVQ_V2_B(sp, l0/2)];
+#pragma unroll
+        for (int j=0;j<3;++j) {
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[j][l0 + 0], sumi[j]);
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[j][l0 + 1], sumi[j]);
+        }
+    }
+
+#pragma unroll
+    for (int j=0;j<3;++j) {
+    sumi[j] *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float((bq8_1+j*stride+iqs/2)->ds);
+    out[j] = d * sumi[j];    }
+}
+
+static __device__ __forceinline__ void vec_dot_iq2_xxs_q8_1_v2_3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int stride, float (&out)[3]) {
+
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq + kbx;
+
+
+    const uint2    qa    = mmvq_v2_ld8((const uint8_t *) bq2->qs + 4*iqs); // x: 4 grid indices, y: signs + scale
+    const uint32_t aux32 = qa.y;
+    int y[3][8];
+#pragma unroll
+    for (int j=0;j<3;++j) mmvq_v2_ld_y(bq8_1+j*stride+iqs/2, y[j]);
+
+    int sumi[3] = {0,0,0};
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid = ((const uint2 *) IQ2XXS_GRID_SRC)[MMVQ_V2_B(qa.x, k0/2)];
+        const uint2 m    = mmvq_v2_sgn7_lds[(aux32 >> (7*k0/2)) & 0x7F];
+#pragma unroll
+        for (int j=0;j<3;++j) {
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.x, m.x), y[j][k0 + 0], sumi[j]);
+        sumi[j] = ggml_cuda_dp4a(mmvq_v2_apply_sign(grid.y, m.y), y[j][k0 + 1], sumi[j]);
+        }
+    }
+
+#pragma unroll
+    for (int j=0;j<3;++j) {
+    const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
+    sumi[j] = sumi[j] * ls / 8;           // (sumi[j] * scale + sumi[j] / 2) / 4
+    const float d = __half2float(bq2->d) * __low2float((bq8_1+j*stride+iqs/2)->ds);
+    out[j] = d * sumi[j];    }
+}
+
+static __device__ __forceinline__ void vec_dot_iq2_xs_q8_1_v2_3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int stride, float (&out)[3]) {
+
+    const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq + kbx;
+
+
+    const uint2 qw  = mmvq_v2_ld8((const uint8_t *) bq2->qs + 4*iqs); // 4 x uint16
+    const int   ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int   ls1 = bq2->scales[iqs/2] >> 4;
+    int y[3][8];
+#pragma unroll
+    for (int j=0;j<3;++j) mmvq_v2_ld_y(bq8_1+j*stride+iqs/2, y[j]);
+
+    int sumi0[3] = {0,0,0};
+    int sumi1[3] = {0,0,0};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint32_t w = l0 < 4 ? qw.x : qw.y;
+        const uint32_t q = (w >> (16*((l0 >> 1) & 1))) & 0xFFFFu;   // q2[l0/2]
+        const uint2 grid = ((const uint2 *) IQ2XS_GRID_SRC)[q & 0x1FF];
+        const uint2 m    = mmvq_v2_sgn7_lds[q >> 9];
+        const int grid_l = mmvq_v2_apply_sign(grid.x, m.x);
+        const int grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        if (l0 < 4) {
+#pragma unroll
+        for (int j=0;j<3;++j) {
+            sumi0[j] = ggml_cuda_dp4a(grid_l, y[j][l0 + 0], sumi0[j]);
+            sumi0[j] = ggml_cuda_dp4a(grid_h, y[j][l0 + 1], sumi0[j]);
+        }
+        } else {
+#pragma unroll
+        for (int j=0;j<3;++j) {
+            sumi1[j] = ggml_cuda_dp4a(grid_l, y[j][l0 + 0], sumi1[j]);
+            sumi1[j] = ggml_cuda_dp4a(grid_h, y[j][l0 + 1], sumi1[j]);
+        }
+        }
+    }
+#pragma unroll
+    for (int j=0;j<3;++j) {
+    const int sum = (sumi0[j]*ls0 + sumi1[j]*ls1 + (sumi0[j] + sumi1[j])/2)/4;
+    const float d = __half2float(bq2->d) * __low2float((bq8_1+j*stride+iqs/2)->ds);
+    out[j] = d * sum;    }
+}
+
+static __device__ __forceinline__ void vec_dot_iq2_s_q8_1_v2_3(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs, const int stride, float (&out)[3]) {
+
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+
+
+    const uint32_t qsw = mmvq_v2_ld4(bq2->qs + 2*iqs);            // get_int_b2(qs, iqs/2): 4 grid-index low bytes
+    const int      qh  = bq2->qh[iqs/2];
+    const uint32_t sp  = mmvq_v2_ld4(bq2->qs + QK_K/8 + 2*iqs);   // get_int_b2(qs, QK_K/32 + iqs/2): 4 sign bytes
+    const int      ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int      ls1 = bq2->scales[iqs/2] >> 4;
+    int y[3][8];
+#pragma unroll
+    for (int j=0;j<3;++j) mmvq_v2_ld_y(bq8_1+j*stride+iqs/2, y[j]);
+
+    int sumi0[3] = {0,0,0};
+    int sumi1[3] = {0,0,0};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid = ((const uint2 *) IQ2S_GRID_SRC)[MMVQ_V2_B(qsw, l0/2) | ((qh << (8 - l0)) & 0x300)];
+        const uint2 m    = mmvq_v2_sgn8_lds[MMVQ_V2_B(sp, l0/2)];
+        const int grid_l = mmvq_v2_apply_sign(grid.x, m.x);
+        const int grid_h = mmvq_v2_apply_sign(grid.y, m.y);
+        if (l0 < 4) {
+#pragma unroll
+        for (int j=0;j<3;++j) {
+            sumi0[j] = ggml_cuda_dp4a(grid_l, y[j][l0 + 0], sumi0[j]);
+            sumi0[j] = ggml_cuda_dp4a(grid_h, y[j][l0 + 1], sumi0[j]);
+        }
+        } else {
+#pragma unroll
+        for (int j=0;j<3;++j) {
+            sumi1[j] = ggml_cuda_dp4a(grid_l, y[j][l0 + 0], sumi1[j]);
+            sumi1[j] = ggml_cuda_dp4a(grid_h, y[j][l0 + 1], sumi1[j]);
+        }
+        }
+    }
+#pragma unroll
+    for (int j=0;j<3;++j) {
+    const int sum = (sumi0[j]*ls0 + sumi1[j]*ls1 + (sumi0[j] + sumi1[j])/2)/4;
+
+    const float d = __half2float(bq2->d) * __low2float((bq8_1+j*stride+iqs/2)->ds);
+    out[j] = d * sum;    }
+}
+
+static __device__ __forceinline__ void vec_dot_q2_K_q8_1_3(
+ const void * vbq, const block_q8_1 * y, const int kbx, const int iqs, const int stride, float (&out)[3]) {
+ const block_q2_K * x=(const block_q2_K *)vbq+kbx;
+ const int offset=QR2_K*(iqs/QI8_1);
+ const uint8_t * scales=x->scales+iqs-iqs%QI8_1+(iqs%QI8_1)/(QI8_1/2);
+ const int v=get_int_b4(x->qs,iqs);
+ float sd[3]={}, sm[3]={};
+#pragma unroll
+ for(int i=0;i<QR2_K;++i) {
+  const int sc=scales[2*i], vi=(v>>(2*i))&0x03030303;
+  int m=sc>>4; m|=m<<8; m|=m<<16;
+#pragma unroll
+  for(int j=0;j<3;++j) {
+   const block_q8_1 * b=y+j*stride+offset+i;
+   const int u=get_int_b4(b->qs,iqs%QI8_1);
+   const float d=__low2float(b->ds);
+   sd[j]+=d*(ggml_cuda_dp4a(vi,u,0)*(sc&15));
+   sm[j]+=d*ggml_cuda_dp4a(m,u,0);
+  }
+ }
+ const float2 dm=__half22float2(x->dm);
+#pragma unroll
+ for(int j=0;j<3;++j) out[j]=dm.x*sd[j]-dm.y*sm[j];
+}
+#endif
 #undef MMVQ_V2_B
 #endif // defined(GGML_USE_HIP) && defined(GGML_EXP_MMVQ_GCN2_IQ3V2)

@@ -403,6 +403,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
+#ifdef GGML_EXP_COLA
+    // ik-style conv chain: keep concat, (view, cpy) x K, ssm_conv, silu contiguous in the node list so the
+    // CUDA backend can run them as one kernel (the kernel reads the state and writes the K snapshots itself)
+    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    cb(conv_output_proper, "conv_output_raw", il);
+
+    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    cb(conv_output_silu, "conv_output_silu", il);
+    if (n_seq_tokens <= 8) {
+        ggml_build_forward_expand(gf, conv_output_silu);
+    }
+#endif // GGML_EXP_COLA
+
 #ifdef GGML_EXP_GDN_NOGATHER
     // no gather: the GDN kernel reads the cell selected by s_copy_main straight from the cache (src[6])
     const bool gdn_by_ids = n_seqs == 1 && n_seq_tokens <= 8 && cparams.fused_gdn_ar && cparams.fused_gdn_ch;
@@ -425,11 +438,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 #endif // GGML_EXP_GDN_NOGATHER
     cb(state, "state_predelta", il);
 
+#ifndef GGML_EXP_COLA
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+#endif // GGML_EXP_COLA
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
