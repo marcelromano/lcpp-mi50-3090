@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -120,6 +121,10 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // chain is [penalties] + top_k(1) + no-ops: result == argmax of penalized logits
+    bool greedy_fast = false;
+    int pen_idx = -1;
 
     void reset() {
         prev.clear();
@@ -422,6 +427,41 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p   = */ {},
     };
 
+    {
+        bool ok = result->params.mirostat == 0 && !result->grmr && !result->rbudget &&
+                  !result->params.backend_sampling && result->params.top_k == 1 && result->params.n_probs == 0;
+        const char * e = std::getenv("LLAMA_SAMPLER_GREEDY_FAST");
+        if (e && std::atoi(e) == 0) {
+            ok = false;
+        }
+        bool seen_topk = false;
+        const int n = llama_sampler_chain_n(result->chain);
+        for (int k = 0; ok && k < n; ++k) {
+            struct llama_sampler * sk = llama_sampler_chain_get(result->chain, k);
+            const std::string nm = llama_sampler_name(sk);
+            if (!nm.empty() && nm[0] == '?') {
+                continue; // disabled sampler (empty placeholder)
+            }
+            if (nm == "penalties") {
+                if (seen_topk) { ok = false; }
+                result->pen_idx = k;
+            } else if (nm == "top-k") {
+                seen_topk = true;
+            } else if (nm == "top-p" || nm == "min-p" || nm == "temp-ext" || nm == "temp" || nm == "dist") {
+                if (!seen_topk) { ok = false; }
+            } else {
+                ok = false;
+            }
+        }
+        result->greedy_fast = ok && seen_topk;
+        if (e && std::atoi(e) == 2) {
+            std::string names;
+            for (int k = 0; k < n; ++k) { names += llama_sampler_name(llama_sampler_chain_get(result->chain, k)); names += ","; }
+            LOG_INF("greedy_fast=%d topk=%d chain=%s top_k=%d mirostat=%d grmr=%d rb=%d bs=%d np=%d\n", (int) result->greedy_fast, (int) seen_topk, names.c_str(), result->params.top_k, result->params.mirostat, result->grmr != nullptr, result->rbudget != nullptr, (int) result->params.backend_sampling, result->params.n_probs);
+        }
+    }
+
+
     return result;
 }
 
@@ -564,6 +604,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
+
+    if (gsmpl->greedy_fast) {
+        float * lg = const_cast<float *>(llama_get_logits_ith(ctx, idx));
+        if (lg) {
+            const int32_t nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            return llama_sampler_penalized_argmax(gsmpl->pen_idx >= 0 ? llama_sampler_chain_get(gsmpl->chain, gsmpl->pen_idx) : nullptr, lg, nv);
+        }
+    }
 
     llama_token id = LLAMA_TOKEN_NULL;
 
