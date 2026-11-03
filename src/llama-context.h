@@ -172,7 +172,13 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                llama_state_seq_limits * limits = nullptr);
+
+    uint64_t state_restore_tensor_capacity() const;
+    uint64_t state_restore_file_capacity(llama_seq_id seq) const;
+    size_t state_seq_load_file_bounded(llama_seq_id seq,const char * path,llama_token * tokens,
+        size_t capacity,size_t * count,llama_state_seq_limits * limits);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,

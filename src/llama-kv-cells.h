@@ -76,6 +76,26 @@ public:
         return pos[i] == -1;
     }
 
+    // Count physical cells, including used cells without a sequence owner.
+    // Shared cells are not reclaimable by removing only this sequence.
+    bool get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const {
+        out = {};
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        out.capacity_cells = size();
+        out.used_cells = get_used();
+        for (const auto i : used) {
+            if (seq[i].test(seq_id)) {
+                ++out.seq_cells;
+                if (seq[i].count() == 1) {
+                    ++out.seq_exclusive_cells;
+                }
+            }
+        }
+        return true;
+    }
+
     uint32_t get_used() const {
         return used.size();
     }
