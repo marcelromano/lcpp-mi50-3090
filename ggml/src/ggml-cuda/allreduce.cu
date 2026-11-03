@@ -11,11 +11,12 @@
 #include <limits>
 
 // ---------------------------------------------------------------------------
-// CUDA AllReduce for tensor-parallel inference across two GPUs.
+// AllReduce for tensor-parallel inference across two GPUs (CUDA or
+// ROCm/HIP).
 //
-// Provides an in-place sum reduction over matching tensors on two CUDA
-// devices in the same process.  Used by the tensor-split path alongside
-// NCCL; targets setups without NVLink, where data is exchanged between the
+// Provides an in-place sum reduction over matching tensors on two GPUs
+// in the same process.  Used by the tensor-split path alongside NCCL;
+// targets setups without NVLink/xGMI, where data is exchanged between the
 // GPUs by staging it through pinned host memory over PCIe.
 //
 // Two reduction strategies are selected per call by tensor size:
@@ -161,11 +162,14 @@ static __global__ void ggml_cuda_ar_kernel(
         __threadfence_system(); // make our signal visible system-wide
 
         while (ggml_cuda_ar_signal_get(other_slot) != token) {
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#ifdef GGML_USE_HIP
+            // Equals ~100ns at 2500 MHz (sleeps for n * [1,64] clock cycles)
+            __builtin_amdgcn_s_sleep(4);
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
 #else
             NO_DEVICE_CODE;
-#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#endif // GGML_USE_HIP
         }
     }
 
@@ -280,7 +284,7 @@ struct ggml_cuda_ar_host_mapping {
         }
         rc = cudaHostGetDevicePointer(reinterpret_cast<void **>(&dev), host, 0);
         if (rc != cudaSuccess) {
-            cudaFreeHost(host);
+            CUDA_CHECK(cudaFreeHost(host));
             host = nullptr;
             dev  = nullptr;
         }
@@ -289,7 +293,7 @@ struct ggml_cuda_ar_host_mapping {
 
     void free() {
         if (host) {
-            cudaFreeHost(host);
+            CUDA_CHECK(cudaFreeHost(host));
             host = nullptr;
             dev  = nullptr;
         }
@@ -401,7 +405,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // The chunked kernel uses __nanosleep, which is sm70+ (Volta+).
+    // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
+    // __builtin_amdgcn_s_sleep (AMD).
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
         if (cc < GGML_CUDA_CC_VOLTA) {
@@ -543,7 +548,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaStreamSynchronize(p->streams[i]);
+            CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
         }
     }
 
@@ -552,28 +557,28 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         p->host_large[i].free();
         if (p->dev_tmp[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaFree(p->dev_tmp[i]);
+            CUDA_CHECK(cudaFree(p->dev_tmp[i]));
         }
         ggml_cuda_set_device(p->devices[i]);
         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-            if (p->ev_pool[i][s].app) { cudaEventDestroy(p->ev_pool[i][s].app); }
+            if (p->ev_pool[i][s].app) { CUDA_CHECK(cudaEventDestroy(p->ev_pool[i][s].app)); }
             for (int c = 0; c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-                if (p->ev_pool[i][s].cpy[c]) { cudaEventDestroy(p->ev_pool[i][s].cpy[c]); }
+                if (p->ev_pool[i][s].cpy[c]) { CUDA_CHECK(cudaEventDestroy(p->ev_pool[i][s].cpy[c])); }
             }
-            if (p->ev_pool[i][s].h2d) { cudaEventDestroy(p->ev_pool[i][s].h2d); }
-            if (p->ev_pool[i][s].ker) { cudaEventDestroy(p->ev_pool[i][s].ker); }
+            if (p->ev_pool[i][s].h2d) { CUDA_CHECK(cudaEventDestroy(p->ev_pool[i][s].h2d)); }
+            if (p->ev_pool[i][s].ker) { CUDA_CHECK(cudaEventDestroy(p->ev_pool[i][s].ker)); }
         }
         if (p->host_large_read_done[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaEventDestroy(p->host_large_read_done[i]);
+            CUDA_CHECK(cudaEventDestroy(p->host_large_read_done[i]));
         }
         if (p->dev_tmp_kernel_done[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaEventDestroy(p->dev_tmp_kernel_done[i]);
+            CUDA_CHECK(cudaEventDestroy(p->dev_tmp_kernel_done[i]));
         }
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
-            cudaStreamDestroy(p->streams[i]);
+            CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
         }
     }
     p->arrival.free();
@@ -952,13 +957,186 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#elif defined(GGML_USE_HIP)
 
-// HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and __nanosleep that this
-// implementation relies on, so the internal AllReduce is a CUDA-only feature.
-// The dispatcher in ggml-cuda.cu treats a nullptr pipeline as "init failed"
-// and silently falls back to the meta backend's generic AllReduce.
+// HIP copy-only AllReduce, BF16 wire. The graph tensors stay F32; the partials are
+// packed to BF16 before the host hop and unpacked when added back, so the PCIe
+// traffic per direction is half of the F32 variant. No host-mapped kernels.
+#include "ggml-impl.h"
+#include <algorithm>
+#include <new>
+
+static constexpr size_t HIP_AR_CAP = 32 * 1024 * 1024;
+static constexpr size_t HIP_AR_CHUNK = 1024 * 1024;
+static constexpr int HIP_AR_CHUNKS = HIP_AR_CAP / HIP_AR_CHUNK;
+struct ggml_cuda_ar_pipeline {
+    int devices[2] = {};
+    void * host[2] = {};   // pinned staging, BF16 payload
+    void * send[2] = {};   // device: local partial packed to BF16
+    void * recv[2] = {};   // device: peer payload, BF16
+    hipStream_t copy[2] = {};
+    hipEvent_t ready[2] = {};
+    hipEvent_t done[2] = {};
+    hipEvent_t staged[2][HIP_AR_CHUNKS] = {};
+    bool used = false;
+};
+
+void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
+    if (!p) { return; }
+    for (int i = 0; i < 2; ++i) {
+        hipSetDevice(p->devices[i]);
+        if (p->used && p->done[i]) { hipEventSynchronize(p->done[i]); }
+        if (p->copy[i]) { hipStreamSynchronize(p->copy[i]); }
+    }
+    for (int i = 0; i < 2; ++i) {
+        hipSetDevice(p->devices[i]);
+        for (int c = 0; c < HIP_AR_CHUNKS; ++c) {
+            if (p->staged[i][c]) { hipEventDestroy(p->staged[i][c]); }
+        }
+        if (p->ready[i]) { hipEventDestroy(p->ready[i]); }
+        if (p->done[i]) { hipEventDestroy(p->done[i]); }
+        if (p->copy[i]) { hipStreamDestroy(p->copy[i]); }
+        if (p->recv[i]) { hipFree(p->recv[i]); }
+        if (p->send[i]) { hipFree(p->send[i]); }
+        if (p->host[i]) { hipHostFree(p->host[i]); }
+    }
+    delete p;
+}
+
+ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n) {
+    if (n != 2 || devices[0] == devices[1]) { return nullptr; }
+    auto * p = new (std::nothrow) ggml_cuda_ar_pipeline;
+    if (!p) { return nullptr; }
+    p->devices[0] = devices[0]; p->devices[1] = devices[1];
+#define HIP_AR_INIT(expr) do { if ((expr) != hipSuccess) { ggml_cuda_ar_pipeline_free(p); return nullptr; } } while (0)
+    for (int i = 0; i < 2; ++i) {
+        HIP_AR_INIT(hipSetDevice(devices[i]));
+        HIP_AR_INIT(hipHostMalloc(&p->host[i], HIP_AR_CAP / 2, hipHostMallocDefault));
+        HIP_AR_INIT(hipMalloc(&p->send[i], HIP_AR_CAP / 2));
+        HIP_AR_INIT(hipMalloc(&p->recv[i], HIP_AR_CAP / 2));
+        HIP_AR_INIT(hipStreamCreateWithFlags(&p->copy[i], hipStreamNonBlocking));
+        HIP_AR_INIT(hipEventCreateWithFlags(&p->ready[i], hipEventDisableTiming));
+        HIP_AR_INIT(hipEventCreateWithFlags(&p->done[i], hipEventDisableTiming));
+        for (int c = 0; c < HIP_AR_CHUNKS; ++c) {
+            HIP_AR_INIT(hipEventCreateWithFlags(&p->staged[i][c], hipEventDisableTiming));
+        }
+    }
+#undef HIP_AR_INIT
+    GGML_LOG_INFO("HIP internal AllReduce active: pinned copy-only BF16 wire, chunk threshold=1 MiB\n");
+    return p;
+}
+
+// F32 -> BF16 (round-to-nearest-even on the 16 discarded mantissa bits) and back.
+// The graph stays F32; only the wire is BF16, so the pair sum keeps F32 semantics
+// apart from the round trip of the peer partial.
+static __device__ __forceinline__ unsigned short hip_ar_f32_to_bf16(float x) {
+    const unsigned int u = __float_as_uint(x);
+    const unsigned int r = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+    return (unsigned short) r;
+}
+
+static __device__ __forceinline__ float hip_ar_bf16_to_f32(unsigned short b) {
+    return __uint_as_float((unsigned int) b << 16);
+}
+
+static __global__ void hip_ar_pack_bf16(unsigned short * dst, const float * src, size_t n) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        dst[i] = hip_ar_f32_to_bf16(src[i]);
+    }
+}
+
+static __global__ void hip_ar_add_bf16(float * dst, const unsigned short * src, size_t n) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+        dst[i] += hip_ar_bf16_to_f32(src[i]);
+    }
+}
+
+static constexpr int hip_ar_blocks(size_t n) {
+    const size_t b = (n + 255) / 256;
+    return int(b < 4096 ? (b == 0 ? 1 : b) : 4096);
+}
+
+bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline * p, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    if (tensors[0]->type != GGML_TYPE_F32 || tensors[1]->type != GGML_TYPE_F32) { return false; }
+    hipStream_t compute[2];
+    for (int i = 0; i < 2; ++i) {
+        auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+        GGML_ASSERT(ctx->device == p->devices[i]);
+        compute[i] = ctx->stream();
+    }
+    const size_t bytes = ggml_nbytes(tensors[0]);
+    for (size_t base = 0; base < bytes; base += HIP_AR_CAP) {
+        const size_t len = std::min(HIP_AR_CAP, bytes - base);   // F32 bytes in this block
+        const size_t wlen = len / 2;                             // BF16 bytes on the wire
+        const size_t step = len < HIP_AR_CHUNK ? len : HIP_AR_CHUNK;
+        const int chunks = int((len + step - 1) / step);
+        // Fence both previous consumers before reusing host staging or events.
+        // The host waits only at buffer reuse, never between the two directions.
+        if (p->used) {
+            for (int i = 0; i < 2; ++i) {
+                CUDA_CHECK(hipSetDevice(p->devices[i]));
+                CUDA_CHECK(hipEventSynchronize(p->done[i]));
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            CUDA_CHECK(hipSetDevice(p->devices[i]));
+            auto * data = static_cast<char *>(tensors[i]->data) + base;
+            if (!(tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                CUDA_CHECK(hipMemsetAsync(data, 0, len, compute[i]));
+            }
+            const size_t nel = len / sizeof(float);
+            hip_ar_pack_bf16<<<hip_ar_blocks(nel), 256, 0, compute[i]>>>(
+                reinterpret_cast<unsigned short *>(p->send[i]), reinterpret_cast<const float *>(data), nel);
+            CUDA_CHECK(hipGetLastError());
+            CUDA_CHECK(hipEventRecord(p->ready[i], compute[i]));
+            CUDA_CHECK(hipStreamWaitEvent(p->copy[i], p->ready[i], 0));
+        }
+        // Submit D2H on both devices first; H2D waits on peer chunk events.
+        for (int c = 0; c < chunks; ++c) {
+            const size_t off = size_t(c) * step;
+            const size_t n = std::min(step, len - off);   // F32 bytes in this chunk
+            for (int i = 0; i < 2; ++i) {
+                CUDA_CHECK(hipSetDevice(p->devices[i]));
+                CUDA_CHECK(hipMemcpyAsync(static_cast<char *>(p->host[i]) + off / 2,
+                    static_cast<char *>(p->send[i]) + off / 2, n / 2, hipMemcpyDeviceToHost, p->copy[i]));
+                CUDA_CHECK(hipEventRecord(p->staged[i][c], p->copy[i]));
+            }
+        }
+        for (int c = 0; c < chunks; ++c) {
+            const size_t off = size_t(c) * step;
+            const size_t n = std::min(step, len - off);
+            for (int i = 0; i < 2; ++i) {
+                CUDA_CHECK(hipSetDevice(p->devices[i]));
+                CUDA_CHECK(hipStreamWaitEvent(compute[i], p->staged[1-i][c], 0));
+                // Do not overwrite the local partial until its own D2H has completed.
+                CUDA_CHECK(hipStreamWaitEvent(compute[i], p->staged[i][c], 0));
+                const size_t nel = n / sizeof(float);
+                CUDA_CHECK(hipMemcpyAsync(static_cast<char *>(p->recv[i]) + off / 2,
+                    static_cast<char *>(p->host[1-i]) + off / 2, n / 2, hipMemcpyHostToDevice, compute[i]));
+                hip_ar_add_bf16<<<hip_ar_blocks(nel), 256, 0, compute[i]>>>(
+                    reinterpret_cast<float *>(static_cast<char *>(tensors[i]->data) + base + off),
+                    reinterpret_cast<const unsigned short *>(static_cast<char *>(p->recv[i]) + off / 2), nel);
+                CUDA_CHECK(hipGetLastError());
+            }
+        }
+        for (int i = 0; i < 2; ++i) {
+            CUDA_CHECK(hipSetDevice(p->devices[i]));
+            CUDA_CHECK(hipEventRecord(p->done[i], compute[i]));
+        }
+        p->used = true;
+        (void) wlen;
+    }
+    return true;
+}
+
+#else // defined(GGML_USE_MUSA)
+
+// MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
+// / cudaHostAllocMapped / cudaHostGetDevicePointer) and a device-side
+// sleep intrinsic that this implementation relies on, so the internal
+// AllReduce is unavailable there. The dispatcher in ggml-cuda.cu treats
+// a nullptr pipeline as "init failed" and silently falls back to the meta
+// backend's generic AllReduce.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
     return nullptr;
 }
@@ -968,4 +1146,4 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
     return false;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
