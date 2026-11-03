@@ -1,13 +1,27 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
+//  (GGML_EXP_SK_FA256, gfx906 only): decode launches one block per Q head, 128 threads = 2 of the 4 SIMDs of
+// a CU, and walks the KV cache in tiles of 128 positions serially (per-tile chain: K loads -> dot -> exp -> V loads).
+// 256 threads = one wave per SIMD and 256 positions per tile (= nbatch_fa already used by launch_fattn for the
+// parallel_blocks bound), so a context <= 256 (padded n_kv) is a single tile. Same per-position work; the sum
+// order of KQ_sum/VKQ changes (not bit-identical, same class as changing parallel_blocks).
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
+#ifdef GGML_EXP_SK_FA256
+    if (GGML_CUDA_CC_IS_GCN(cc)) {
+        return 256;
+    }
+#endif // GGML_EXP_SK_FA256
     return 128;
     GGML_UNUSED(cc);
 }
 
 static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+#if defined(GGML_EXP_SK_FA256) && defined(GGML_USE_HIP) && defined(__gfx906__)
+    return 256;
+#else
     return 128;
+#endif // GGML_EXP_SK_FA256
 }
 
 // Currently llvm with the amdgcn target does not support unrolling loops
@@ -540,7 +554,13 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+#ifdef GGML_EXP_FA_LC_PB
+    // o tile do kernel vec e nthreads (128) posicoes, nao D (256): deixa parallel_blocks subir ate n_kv/128
+    const int nbatch_fa = nthreads;
+#else
+    const int nbatch_fa = D;
+#endif // GGML_EXP_FA_LC_PB
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, need_f16_K, need_f16_V, false);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
