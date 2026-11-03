@@ -6,10 +6,11 @@ same source tree (no pip install). Usage: gen_synth_hybrid.py OUT.gguf [SRC_TREE
 Layers: 4 (interval 4 -> layers 0,1,2 recurrent, layer 3 full attention).
 """
 import sys
+from pathlib import Path
 import numpy as np
 
 out = sys.argv[1]
-tree = sys.argv[2] if len(sys.argv) > 2 else "/tmp/llama-fork"
+tree = sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, tree + "/gguf-py")
 import gguf  # noqa: E402
 

@@ -4,10 +4,11 @@ Stand-in for the absent /tmp/llama-test-attention.gguf in the attention-only kv-
 (two-contexts, bounded-reader, r4-r5). Usage: gen_synth_attn.py OUT.gguf [SRC_TREE]
 """
 import sys
+from pathlib import Path
 import numpy as np
 
 out = sys.argv[1]
-tree = sys.argv[2] if len(sys.argv) > 2 else "/tmp/llama-fork"
+tree = sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, tree + "/gguf-py")
 import gguf  # noqa: E402
 
