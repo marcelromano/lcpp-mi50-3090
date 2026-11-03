@@ -19,7 +19,7 @@ Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) tuned for tw
 | Memory resource capacity API, per-sequence KV window, state I/O limits | both | Original |
 | KV admission, restore under admission, slot operations, proxy-cancel fix (server) | both | Original |
 
-Part of the kernels was developed with the help of AI agents. Everything is opt-in at build time (`GGML_EXP_*` macros) or at runtime (environment variables); see the comments at the top of each kernel file. Upstream behavior is the default.
+Everything is opt-in at build time (`GGML_EXP_*` macros) or at runtime (environment variables); see the comments at the top of each kernel file. Upstream behavior is the default.
 
 ---
 
