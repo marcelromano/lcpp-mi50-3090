@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -45,6 +46,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_chunk[s].clear();
         }
     }
 
@@ -74,6 +76,26 @@ public:
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
 
         return pos[i] == -1;
+    }
+
+    // Count physical cells, including used cells without a sequence owner.
+    // Shared cells are not reclaimable by removing only this sequence.
+    bool get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const {
+        out = {};
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        out.capacity_cells = size();
+        out.used_cells = get_used();
+        for (const auto i : used) {
+            if (seq[i].test(seq_id)) {
+                ++out.seq_cells;
+                if (seq[i].count() == 1) {
+                    ++out.seq_exclusive_cells;
+                }
+            }
+        }
+        return true;
     }
 
     uint32_t get_used() const {
@@ -243,6 +265,7 @@ public:
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, pos[i]);
+        seq_chunk_dec(seq_id, i);
 
         if (seq[i].none()) {
             pos[i] = -1;
@@ -267,6 +290,7 @@ public:
 
             seq[i].set(seq_id);
             seq_pos_inc(seq_id, pos[i]);
+            seq_chunk_inc(seq_id, i);
 
             return false;
         }
@@ -313,6 +337,7 @@ public:
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, pos[i]);
+        seq_chunk_inc(seq_id, i);
     }
 
     // return the sequence id of this cell
@@ -357,6 +382,73 @@ public:
         assert(seq_pos[seq_id].rbegin()->second > 0);
 
         return seq_pos[seq_id].rbegin()->first;
+    }
+
+    // widen [c0, c1] to the chunks of SEQ_CHUNK cells that hold sequence seq_id
+    // return false if the sequence is in no cell
+    bool seq_chunk_range(llama_seq_id seq_id, uint32_t & c0, uint32_t & c1) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & cnt = seq_chunk[seq_id];
+        if (seq_pos[seq_id].empty() || cnt.empty()) {
+            return false;
+        }
+
+        uint32_t lo = 0;
+        while (cnt[lo] == 0) {
+            ++lo;
+        }
+
+        uint32_t hi = cnt.size() - 1;
+        while (cnt[hi] == 0) {
+            --hi;
+        }
+
+        c0 = std::min(c0, lo);
+        c1 = std::max(c1, hi);
+
+        return true;
+    }
+
+    // the highest index of a cell holding sequence seq_id, -1 if there is none
+    int64_t seq_cell_last(llama_seq_id seq_id) const {
+        uint32_t c0 = UINT32_MAX;
+        uint32_t c1 = 0;
+
+        if (!seq_chunk_range(seq_id, c0, c1)) {
+            return -1;
+        }
+
+        const uint32_t i0 = c1*SEQ_CHUNK;
+        for (uint32_t i = std::min<uint32_t>(pos.size(), i0 + SEQ_CHUNK); i > i0; --i) {
+            if (seq[i - 1].test(seq_id)) {
+                return i - 1;
+            }
+        }
+
+        assert(false);
+        return -1;
+    }
+
+    // the longest run of empty cells: [start, start + len)
+    void free_run_max(uint32_t & start, uint32_t & len) const {
+        start = 0;
+        len   = 0;
+
+        uint32_t next = 0; // first cell after the previous used one
+        for (const uint32_t u : used) {
+            if (u - next > len) {
+                start = next;
+                len   = u - next;
+            }
+            next = u + 1;
+        }
+
+        if (pos.size() - next > len) {
+            start = next;
+            len   = pos.size() - next;
+        }
     }
 
     // note: call only if the cell is not empty
@@ -498,6 +590,33 @@ private:
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
 
+public:
+    // cells are counted per sequence in chunks of this many, the granularity of seq_chunk_range()
+    static constexpr uint32_t SEQ_CHUNK = 256;
+
+private:
+    // seq_chunk[s][c] is the number of cells in [c*SEQ_CHUNK, (c + 1)*SEQ_CHUNK) that carry sequence s
+    // a unified cache uses it to attend only the span of the cells holding the sequences of a ubatch
+    // allocated on the first cell of the sequence, kept in step with seq_pos
+    std::vector<uint32_t> seq_chunk[LLAMA_MAX_SEQ];
+
+    void seq_chunk_dec(llama_seq_id s, uint32_t i) {
+        if (seq_chunk[s].empty()) {
+            return;
+        }
+
+        assert(seq_chunk[s][i/SEQ_CHUNK] > 0);
+        seq_chunk[s][i/SEQ_CHUNK]--;
+    }
+
+    void seq_chunk_inc(llama_seq_id s, uint32_t i) {
+        if (seq_chunk[s].empty()) {
+            seq_chunk[s].assign((pos.size() + SEQ_CHUNK - 1)/SEQ_CHUNK, 0);
+        }
+
+        seq_chunk[s][i/SEQ_CHUNK]++;
+    }
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
@@ -518,6 +637,7 @@ private:
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
                 seq_pos_dec(s, pos[i]);
+                seq_chunk_dec(s, i);
             }
         }
     }
@@ -527,6 +647,7 @@ private:
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
                 seq_pos_inc(s, pos[i]);
+                seq_chunk_inc(s, i);
             }
         }
     }

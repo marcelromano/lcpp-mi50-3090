@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cells.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -14,10 +15,12 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <filesystem>
 
 //
 // llama_context
@@ -2535,6 +2538,51 @@ private:
     size_t size_written = 0;
 };
 
+#ifdef GGML_EXP_CKPT_FAST
+// Reusable pinned staging buffer per host buffer type, for faster device -> host tensor copies.
+// Assumes a single calling thread (llama-server main loop); not thread-safe.
+// ggml_backend_tensor_get() into pinned memory is a DMA copy (ggml-cuda.cu:790-796:
+// cudaMemcpyAsync + cudaStreamSynchronize); pageable memory goes through a driver staging copy.
+// The buffers are intentionally never freed (avoids teardown-order issues with the backend at exit).
+struct llama_ckpt_staging {
+    ggml_backend_buffer_type_t buft;
+    ggml_backend_buffer_t      buf; // nullptr if the allocation failed
+    size_t                     size;
+};
+
+static const llama_ckpt_staging & llama_ckpt_get_staging(ggml_backend_buffer_type_t host_buft) {
+    static constexpr size_t STAGING_SIZE = 64u*1024*1024;
+    static std::vector<llama_ckpt_staging> * cache = new std::vector<llama_ckpt_staging>();
+
+    for (const auto & s : *cache) {
+        if (s.buft == host_buft) {
+            return s;
+        }
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, STAGING_SIZE);
+    cache->push_back({host_buft, buf, buf ? ggml_backend_buffer_get_size(buf) : 0});
+    return cache->back();
+}
+
+// returns the pinned staging buffer for a device buffer, or nullptr if the tensor is host-resident
+// or its backend has no (usable) host buffer type
+static const llama_ckpt_staging * llama_ckpt_get_staging_for(ggml_backend_buffer_t tbuf) {
+    if (tbuf == nullptr || ggml_backend_buffer_is_host(tbuf)) {
+        return nullptr;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tbuf));
+    ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    if (host_buft == nullptr) {
+        return nullptr;
+    }
+
+    const llama_ckpt_staging & s = llama_ckpt_get_staging(host_buft);
+    return (s.buf != nullptr && s.size > 0) ? &s : nullptr;
+}
+#endif
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
@@ -2542,9 +2590,44 @@ public:
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
+#ifdef GGML_EXP_CKPT_FAST
+        for (const auto & winfo : winfos) {
+            ggml_backend_buffer_t tbuf = winfo.tensor->view_src ? winfo.tensor->view_src->buffer : winfo.tensor->buffer;
+            const llama_ckpt_staging * st = llama_ckpt_get_staging_for(tbuf);
+
+            if (st == nullptr) {
+                // no pinned host buffer available (e.g. CPU): original path
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                continue;
+            }
+
+            // copy in blocks through the pinned staging buffer
+            uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(st->buf);
+            size_t done = 0;
+            while (done < winfo.size) {
+                size_t n = std::min(st->size, winfo.size - done);
+                // A split-tensor (meta) buffer only accepts reads that are whole rows (ggml-backend-meta.cpp,
+                // chunk_size_full = nb[axis+1]); round the block down to a multiple of the row size nb[1].
+                if (n < winfo.size - done && winfo.tensor->nb[1] > 0) {
+                    const size_t row = winfo.tensor->nb[1];
+                    n = (n / row) * row;
+                    if (n == 0) {
+                        n = winfo.size - done; // row larger than the staging buffer: read it directly
+                        ggml_backend_tensor_get(winfo.tensor, winfo.ptr + done, winfo.offset + done, n);
+                        done += n;
+                        continue;
+                    }
+                }
+                ggml_backend_tensor_get(winfo.tensor, stage, winfo.offset + done, n);
+                memcpy(winfo.ptr + done, stage, n);
+                done += n;
+            }
+        }
+#else
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+#endif
     }
 
     void write(const void * src, size_t size) override {
@@ -2594,9 +2677,33 @@ public:
 
     ~llama_io_read_host() {
         // flush the reads
+#ifdef GGML_EXP_CKPT_FAST
+        // never hand pageable memory to the backend: stage through the pinned buffer
+        // (pageable H2D via hipMemcpyAsync was observed to fault on ROCm with THP-backed sources)
+        for (const auto & rinfo : rinfos) {
+            ggml_backend_buffer_t tbuf = rinfo.tensor->view_src ? rinfo.tensor->view_src->buffer : rinfo.tensor->buffer;
+            const llama_ckpt_staging * st = llama_ckpt_get_staging_for(tbuf);
+
+            if (st == nullptr) {
+                // no pinned host buffer available (e.g. CPU): original path
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+                continue;
+            }
+
+            uint8_t * stage = (uint8_t *) ggml_backend_buffer_get_base(st->buf);
+            size_t done = 0;
+            while (done < rinfo.size) {
+                const size_t n = std::min(st->size, rinfo.size - done);
+                memcpy(stage, rinfo.ptr + done, n);
+                ggml_backend_tensor_set(rinfo.tensor, stage, rinfo.offset + done, n);
+                done += n;
+            }
+        }
+#else
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+#endif
     }
 
     void read(void * dst, size_t size) override {
@@ -2667,7 +2774,14 @@ private:
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f, llama_state_seq_limits * authority = nullptr) : llama_io_read_i(authority), file(f) {}
+
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+    ~llama_io_read_file() {
+        fprintf(stderr, "%s: restore io: %zu read_tensor calls, %.1f MiB, t_file %.1f ms, t_set %.1f ms, t_total %.1f ms\n", __func__,
+                n_tensor_calls, size_tensor/1024.0/1024.0, t_file_us/1000.0, t_set_us/1000.0, (ggml_time_us() - t_start_us)/1000.0);
+    }
+#endif
 
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
@@ -2675,9 +2789,22 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (limits && size > limits->max_tensor_bytes) {
+            limits->limit_refused=true;
+            throw std::runtime_error("tensor scratch exceeds host byte bound");
+        }
         temp_buffer.resize(size);
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+        const int64_t t0 = ggml_time_us();
+        read(temp_buffer.data(), size);
+        const int64_t t1 = ggml_time_us();
+        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+        const int64_t t2 = ggml_time_us();
+        t_file_us += t1 - t0; t_set_us += t2 - t1; n_tensor_calls++; size_tensor += size;
+#else
         read(temp_buffer.data(), size);
         ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+#endif
     }
 
     size_t n_bytes() override {
@@ -2688,6 +2815,11 @@ private:
     llama_file * file;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+    int64_t t_start_us = ggml_time_us();
+    int64_t t_file_us = 0, t_set_us = 0;
+    size_t  n_tensor_calls = 0, size_tensor = 0;
+#endif
 };
 
 class llama_io_write_device : public llama_io_write_i {
@@ -3074,8 +3206,17 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_seq_limits * limits) {
+    if(limits) return state_seq_load_file_bounded(seq_id,filepath,tokens_out,n_token_capacity,n_token_count_out,limits);
+    auto clear_destination = [&]() {
+        // A bounded rejection before any native replacement preserves the slot.
+        if (memory && (!limits || limits->mutation_started)) {
+            memory->seq_rm(seq_id, -1, -1);
+        }
+    };
+    try {
     llama_file file(filepath, "rb");
+    size_t loaded_token_count = 0;
 
     // version checks
     {
@@ -3084,6 +3225,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 
         if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
+            clear_destination();
             return 0;
         }
     }
@@ -3094,31 +3236,56 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 
         if (n_token_count > n_token_capacity) {
             LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
+            clear_destination();
             return 0;
         }
 
         file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-        *n_token_count_out = n_token_count;
+        loaded_token_count = n_token_count;
     }
 
     // restore the context state
     {
-        const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+        const size_t offset_before_state = file.tell();
+        if (offset_before_state > file.size()) {
+            clear_destination();
+            return 0;
+        }
+        const size_t state_size = file.size() - offset_before_state;
+        llama_io_read_file io(&file, limits);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
+            clear_destination();
             return 0;
         }
-        GGML_ASSERT(nread <= state_size);
-        GGML_ASSERT(nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * *n_token_count_out == file.tell());
+        if (nread > state_size ||
+                nread + sizeof(uint32_t) * 3 + sizeof(llama_token) * loaded_token_count != file.tell() ||
+                file.tell() != file.size()) {
+            LLAMA_LOG_ERROR("%s: invalid or truncated sequence state file\n", __func__);
+            clear_destination();
+            return 0;
+        }
     }
 
+    *n_token_count_out = loaded_token_count;
     return file.tell();
+    } catch (...) {
+        clear_destination();
+        throw;
+    }
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
-    llama_file file(filepath, "wb");
+    const std::string tmp_path = std::string(filepath) + ".tmp";
+    struct temp_file_cleanup {
+        const std::string & path;
+        ~temp_file_cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{tmp_path};
+    llama_file file(tmp_path.c_str(), "wb");
 
     file.write_u32(LLAMA_STATE_SEQ_MAGIC);
     file.write_u32(LLAMA_STATE_SEQ_VERSION);
@@ -3131,10 +3298,24 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     llama_io_write_file io(&file);
     state_seq_write_data(io, seq_id, 0);
 
-    const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
-
-    return res;
+    const size_t logical_size = file.tell();
+    if (logical_size != sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes()) {
+        throw std::runtime_error("inconsistent sequence state byte count");
+    }
+    const size_t closed_size = file.finalize();
+    if (closed_size != logical_size) {
+        throw std::runtime_error(format("sequence state size mismatch after close: %zu != %zu", closed_size, logical_size));
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, filepath, ec);
+    if (ec) {
+        throw std::runtime_error(format("failed to publish sequence state file: %s", ec.message().c_str()));
+    }
+    const uintmax_t published_size = std::filesystem::file_size(filepath, ec);
+    if (ec || published_size != closed_size) {
+        throw std::runtime_error("published sequence state file size mismatch");
+    }
+    return (size_t) published_size;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -3964,6 +4145,34 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_get_seq_capacity(llama_memory_t mem, llama_seq_id seq_id, llama_memory_seq_capacity * out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+    return mem && mem->get_seq_capacity(seq_id, *out);
+}
+
+bool llama_memory_get_resource_capacity(llama_memory_t mem, llama_seq_id seq_id, llama_memory_resource_capacity * out, size_t out_size) {
+    if (!out) {
+        return false;
+    }
+    if (out_size < sizeof(*out)) {
+        memset(out, 0, out_size);
+        return false;
+    }
+    *out = {};
+    if (!mem) {
+        return false;
+    }
+    llama_memory_resource_capacity result = {};
+    if (!mem->get_resource_capacity(seq_id, result)) {
+        return false;
+    }
+    *out = result;
+    return true;
+}
+
 // llama state API
 
 // deprecated
@@ -4068,6 +4277,152 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
         return 0;
     }
+}
+
+
+// One engine-owned immutable capture, one open file handle. Both passes use the
+// SAME native parser; there is no independent scanner or pathname reopen.
+class llama_io_read_restore_snapshot : public llama_io_read_i {
+    const uint8_t * ptr; size_t remaining,read_bytes=0; uint64_t tensor_bytes=0;
+    bool validating;
+public:
+    llama_io_read_restore_snapshot(const uint8_t * data,size_t size,llama_state_seq_limits * l,bool validation)
+        : llama_io_read_i(l),ptr(data),remaining(size),validating(validation) {}
+    bool validation_only() const override { return validating; }
+    bool destination_precleared() const override { return !validating; }
+    void restore_cells(uint32_t kind,uint32_t stream,uint64_t count) override {
+        // The immutable capture was charged once in the validation pass. The
+        // execution pass cannot change any count, stream or payload byte.
+        if(validating) llama_io_read_i::restore_cells(kind,stream,count);
+    }
+    void read(void * dst,size_t size) override {
+        if(size>remaining) throw std::runtime_error("truncated immutable restore snapshot");
+        if(size) std::memcpy(dst,ptr,size);
+        ptr+=size;remaining-=size;read_bytes+=size;
+    }
+    void read_tensor(ggml_tensor * tensor,size_t offset,size_t size) override {
+        if(size>remaining || size>limits->max_tensor_bytes) {
+            limits->limit_refused=true;throw std::runtime_error("bounded tensor payload refused");
+        }
+        if(!validating) {
+            if(size>std::numeric_limits<uint64_t>::max()-tensor_bytes) throw std::runtime_error("tensor byte overflow");
+            tensor_bytes+=size;
+            if(limits->before_tensor_write && !limits->before_tensor_write(limits->user,tensor_bytes))
+                throw std::runtime_error("injected truncated tensor after replacement");
+            ggml_backend_tensor_set(tensor,ptr,offset,size);
+        }
+        ptr+=size;remaining-=size;read_bytes+=size;
+    }
+    size_t n_bytes() override { return read_bytes; }
+};
+
+uint64_t llama_context::state_restore_file_capacity(llama_seq_id seq) const {
+    if(!memory || seq<0) return 0;
+    llama_memory_resource_capacity raw{};
+    if(!memory->get_resource_capacity(seq,raw)) return 0;
+    uint64_t result=state_restore_tensor_capacity();if(!result) return 0;
+    auto sum=[&](uint64_t a,uint64_t b) {
+        if(a && b>std::numeric_limits<uint64_t>::max()/a) return false;
+        const uint64_t part=a*b;
+        if(part>std::numeric_limits<uint64_t>::max()-result) return false;
+        result+=part;return true;
+    };
+    // Physical tensor buffers bound all payloads. Each single-seq attention
+    // cell carries pos/u32/one seq ID/optional ext; each recurrent cell pos/u32.
+    // Per attention layer: K(12), V(12), optional k_idx flag/type/row(16).
+    if(!sum(3,sizeof(uint32_t)) || !sum(cparams.n_ctx,sizeof(llama_token))) return 0;
+    if(raw.attention_known) {
+        const uint64_t streams=raw.attention_stream_count;
+        if(!streams || !sum(uint64_t(raw.attention_capacity_cells)*streams,
+                sizeof(llama_pos)+sizeof(uint32_t)+sizeof(llama_seq_id)+sizeof(llama_kv_cell_ext)) ||
+                !sum(streams,sizeof(uint32_t)+12+uint64_t(model.hparams.n_layer())*40) || !sum(1,sizeof(uint32_t))) return 0;
+    }
+    if(raw.recurrent_known) {
+        const uint64_t groups=raw.recurrent_rollback_groups;
+        if(!groups || raw.recurrent_capacity_rows%groups ||
+                !sum(raw.recurrent_capacity_rows/groups,sizeof(llama_pos)+sizeof(uint32_t)) ||
+                !sum(1,sizeof(uint32_t)+8+uint64_t(model.hparams.n_layer())*24)) return 0;
+    }
+    return result;
+}
+
+size_t llama_context::state_seq_load_file_bounded(llama_seq_id seq,const char * path,llama_token * tokens,
+        size_t capacity,size_t * count,llama_state_seq_limits * limits) {
+    std::vector<uint8_t> snapshot;
+    try {
+        llama_file file(path,"rb");
+        uint64_t bound=state_restore_file_capacity(seq);
+        if(limits->max_snapshot_bytes) bound=std::min(bound,limits->max_snapshot_bytes);
+        const size_t bytes=file.size();
+        if(!bound || bytes>bound || bytes<3*sizeof(uint32_t)) {
+            limits->limit_refused=true;throw std::runtime_error("snapshot exceeds derived host bound");
+        }
+        snapshot.resize(bytes);file.read_raw(snapshot.data(),bytes);
+        uint32_t header[3];std::memcpy(header,snapshot.data(),sizeof(header));
+        if(header[0]!=LLAMA_STATE_SEQ_MAGIC || header[1]!=LLAMA_STATE_SEQ_VERSION || header[2]>capacity ||
+                uint64_t(header[2])*sizeof(llama_token)>bytes-sizeof(header)) throw std::runtime_error("invalid bounded snapshot header");
+        const size_t prefix=sizeof(header)+size_t(header[2])*sizeof(llama_token);
+        const size_t payload=bytes-prefix;
+        {
+            llama_io_read_restore_snapshot validation(snapshot.data()+prefix,payload,limits,true);
+            if(state_seq_read_data(validation,seq,0)!=payload) throw std::runtime_error("bounded snapshot trailing data");
+        }
+        limits->mutation_started=true;++limits->clear_count;
+        if(limits->before_replace) limits->before_replace(limits->user);
+        if(memory && !memory->seq_rm(seq,-1,-1)) throw std::runtime_error("bounded destination replacement refused");
+        {
+            llama_io_read_restore_snapshot execution(snapshot.data()+prefix,payload,limits,false);
+            if(state_seq_read_data(execution,seq,0)!=payload) throw std::runtime_error("bounded snapshot execution mismatch");
+        }
+        // Keep the immutable host capture alive until all tensor writes fence.
+        synchronize();
+        if(header[2]) std::memcpy(tokens,snapshot.data()+sizeof(header),size_t(header[2])*sizeof(llama_token));
+        *count=header[2];return bytes;
+    } catch(...) {
+        if(limits->mutation_started && memory) { ++limits->clear_count;memory->seq_rm(seq,-1,-1); }
+        synchronize(); // before destroying any queued-write source buffer
+        return 0;
+    }
+}
+
+uint64_t llama_state_seq_restore_file_capacity(llama_context * ctx,llama_seq_id seq) {
+    return ctx ? ctx->state_restore_file_capacity(seq) : 0;
+}
+
+uint64_t llama_context::state_restore_tensor_capacity() const {
+    if (!memory) return 0;
+    uint64_t total=0;
+    for (const auto & item:memory->memory_breakdown()) {
+        if (item.second>std::numeric_limits<uint64_t>::max()-total) return 0;
+        total+=item.second;
+    }
+    return total;
+}
+
+uint64_t llama_state_seq_restore_tensor_capacity(llama_context * ctx) {
+    return ctx ? ctx->state_restore_tensor_capacity() : 0;
+}
+
+size_t llama_state_seq_load_file_bounded(llama_context * ctx, const char * filepath, llama_seq_id seq,
+        llama_token * tokens, size_t capacity, size_t * count, llama_state_seq_limits * limits) {
+    if (!ctx || !limits || !limits->consume || seq<0 || !count || (!tokens && capacity)) return 0;
+    limits->clear_count=0; limits->allocation_count=0; limits->fence_count=0;
+    limits->mutation_started=false; limits->limit_refused=false;
+    ctx->synchronize();
+    llama_memory_resource_capacity physical{};
+    if (!llama_memory_get_resource_capacity(llama_get_memory(ctx),seq,&physical,sizeof(physical)) ||
+            !physical.attention_known) {
+        limits->limit_refused=true;
+        ctx->synchronize(); ++limits->fence_count;
+        return 0; // refuse unknown / recurrent-only layout BEFORE the sub-readers (hybrid attention+recurrent is read by the native readers, charged per (kind,stream))
+    }
+    size_t result=0;
+    try { result=ctx->state_seq_load_file(seq,filepath,tokens,capacity,count,limits); }
+    catch (const std::exception & err) { LLAMA_LOG_ERROR("%s: %s\n",__func__,err.what()); }
+    // Includes failed/truncated reads and all queued tensor writes/cleanup.
+    ctx->synchronize();
+    ++limits->fence_count;
+    return result;
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {

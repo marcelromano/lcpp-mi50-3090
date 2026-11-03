@@ -60,6 +60,7 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    bool get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const override;
 
     // state write/load
 

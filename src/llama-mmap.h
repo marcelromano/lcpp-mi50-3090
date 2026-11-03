@@ -20,6 +20,9 @@ struct llama_file {
 
     size_t tell() const;
     size_t size() const;
+    // Flush and close output, then return the size observed after close.
+    // This is process-level completion, not a power-loss durability promise.
+    size_t finalize();
 
     int file_id() const; // fileno overload
 

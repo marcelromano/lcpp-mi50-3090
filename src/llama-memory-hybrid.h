@@ -9,6 +9,11 @@
 #include <memory>
 #include <vector>
 
+bool llama_memory_compose_resource_capacity(
+        const llama_memory_resource_capacity & attention,
+        const llama_memory_resource_capacity & recurrent,
+        llama_memory_resource_capacity & out);
+
 //
 // llama_memory_hybrid
 //
@@ -57,6 +62,8 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const override;
+    bool get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const override;
 
     void clear(bool data) override;
 

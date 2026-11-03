@@ -130,6 +130,8 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const override;
+    bool get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const override;
 
     void clear(bool data) override;
 
@@ -170,9 +172,17 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
-    // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    // a unified cache holding several sequences attends only the cells of the ubatch's sequences:
+    // [lo, lo + n_kv) spans every cell of them. without the window it is [0, get_n_kv(sinfo))
+    // the graph must index cells relative to lo (KQ mask, get_k/get_v views); cpy_k/cpy_v stay absolute
+    void set_window(bool enable);
+    bool get_window() const;
+
+    void get_kv_window(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & n_kv) const;
+
+    // get views of the current state of the cache, cells [lo, lo + n_kv)
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t lo = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t lo = 0) const;
     ggml_tensor * get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -195,6 +205,9 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    // find_slot for a cache with the KV window: keep the cells of each sequence together, so its window stays tight
+    slot_info find_slot_window(const llama_ubatch & ubatch) const;
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -213,7 +226,8 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // dst column j is cell lo + j
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t lo = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -265,6 +279,9 @@ private:
 
     // set when a k_idx (indexer) cache exists and the stream layout supports MSA (single seq, or one stream per seq)
     bool msa_strict_slots = false;
+
+    // see set_window()
+    bool window = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -372,6 +389,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // first cell of the window the graph attends: get_k/get_v and the KQ mask start there
+    uint32_t get_kv_lo() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -441,4 +461,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // see llama_kv_cache::get_kv_window()
+    uint32_t kv_lo = 0;
 };

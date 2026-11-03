@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <sys/stat.h>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -67,6 +68,7 @@ static std::string llama_format_win_err(DWORD err) {
 
 struct llama_file::impl {
 #if defined(_WIN32)
+    std::string fname;
     HANDLE fp_win32;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
@@ -83,7 +85,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -172,6 +174,31 @@ struct llama_file::impl {
 
     bool has_direct_io() const {
         return true;
+    }
+
+    size_t finalize() {
+        if (!owns_fp || fp == nullptr) {
+            throw std::runtime_error("file is not owned or already finalized");
+        }
+        const int flush_error = std::fflush(fp);
+        const int flush_errno = errno;
+        FILE * closing = fp;
+        fp = nullptr;
+        owns_fp = false;
+        const int close_error = std::fclose(closing);
+        const int close_errno = errno;
+        if (flush_error != 0) {
+            throw std::runtime_error(format("flush error: %s", strerror(flush_errno)));
+        }
+        if (close_error != 0) {
+            throw std::runtime_error(format("close error: %s", strerror(close_errno)));
+        }
+        struct _stat64 st{};
+        if (_stat64(fname.c_str(), &st) != 0) {
+            throw std::runtime_error(format("stat error after close: %s", strerror(errno)));
+        }
+        size = (size_t) st.st_size;
+        return size;
     }
 
     ~impl() {
@@ -373,6 +400,34 @@ struct llama_file::impl {
         return fd != -1 && alignment > 1;
     }
 
+    size_t finalize() {
+        if (fd != -1) {
+            throw std::runtime_error("cannot finalize a direct-I/O input file");
+        }
+        if (!owns_fp || fp == nullptr) {
+            throw std::runtime_error("file is not owned or already finalized");
+        }
+        const int flush_error = std::fflush(fp);
+        const int flush_errno = errno;
+        FILE * closing = fp;
+        fp = nullptr;
+        owns_fp = false;
+        const int close_error = std::fclose(closing);
+        const int close_errno = errno;
+        if (flush_error != 0) {
+            throw std::runtime_error(format("flush error: %s", strerror(flush_errno)));
+        }
+        if (close_error != 0) {
+            throw std::runtime_error(format("close error: %s", strerror(close_errno)));
+        }
+        struct stat st{};
+        if (::stat(fname.c_str(), &st) != 0) {
+            throw std::runtime_error(format("stat error after close: %s", strerror(errno)));
+        }
+        size = (size_t) st.st_size;
+        return size;
+    }
+
     ~impl() {
         if (fd != -1) {
             close(fd);
@@ -404,6 +459,7 @@ llama_file::~llama_file() = default;
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
+size_t llama_file::finalize() { return pimpl->finalize(); }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }

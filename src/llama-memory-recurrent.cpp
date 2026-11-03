@@ -692,6 +692,122 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
+bool llama_memory_recurrent::get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const {
+    out = {};
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size() || cells.size() != size ||
+            rs_idx.size() > size || size > INT32_MAX) {
+        return false;
+    }
+
+    const uint64_t groups64 = uint64_t(n_rs_seq) + 1;
+    const uint64_t capacity64 = uint64_t(size) * groups64;
+    if (groups64 > UINT32_MAX || capacity64 > UINT32_MAX || used > size ||
+            r_l.size() != hparams.n_layer() || s_l.size() != hparams.n_layer()) {
+        return false;
+    }
+
+    bool has_state_tensor = false;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        if ((r_l[il] == nullptr) != (s_l[il] == nullptr)) return false;
+        if (r_l[il]) {
+            has_state_tensor = true;
+            if (r_l[il]->ne[1] < 0 || s_l[il]->ne[1] < 0 ||
+                    (uint64_t) r_l[il]->ne[1] != capacity64 || (uint64_t) s_l[il]->ne[1] != capacity64) {
+                return false;
+            }
+        }
+    }
+    if (!has_state_tensor) return false;
+
+    uint32_t used_cells = 0;
+    uint32_t seq_cells = 0;
+    uint32_t seq_exclusive_cells = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        const auto & cell = cells[i];
+        if (cell.tail < -1 || (cell.tail >= 0 && (uint32_t) cell.tail >= size) ||
+                cell.src < -1 || (cell.src >= 0 && (uint32_t) cell.src >= size) ||
+                cell.src0 < -1 || (cell.src0 >= 0 && (uint32_t) cell.src0 >= size)) {
+            return false;
+        }
+
+        if (cell.is_empty()) {
+            if (cell.pos != -1) {
+                return false;
+            }
+        } else {
+            if (cell.pos < 0) {
+                return false;
+            }
+            ++used_cells;
+            if (cell.has_seq_id(seq_id)) {
+                ++seq_cells;
+                if (cell.seq_id.size() == 1) {
+                    ++seq_exclusive_cells;
+                }
+            }
+            for (const llama_seq_id owner : cell.seq_id) {
+                if (owner < 0 || (size_t) owner >= rs_idx.size() || cells[owner].tail != (int32_t) i) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (used_cells != used) {
+        return false;
+    }
+    for (size_t seq = 0; seq < rs_idx.size(); ++seq) {
+        const int32_t tail = cells[seq].tail;
+        bool has_owner = false;
+        for (const auto & cell : cells) {
+            has_owner = has_owner || cell.has_seq_id((llama_seq_id) seq);
+        }
+        if (rs_idx[seq] > n_rs_seq || ((tail >= 0) != has_owner)) {
+            return false;
+        }
+    }
+
+    // src/src0 are committed row-lineage metadata used by recurrent graph inputs.
+    // Every nonempty reference is bounds-checked above; an empty row with a source
+    // is valid only when an occupied row still names it. src0 on an empty
+    // row is historical graph-input metadata (seq_rm does not clear it), not
+    // a current owner or new allocation. Its range remains checked above.
+    // Empty self-src rows are zero scratch rows left by find_slot's gap
+    // handling; they have no seq owner and allocate no extra tensor storage.
+    // This observation is NOT a graph fence; admission must synchronize its
+    // real context at an engine task boundary before using any row credit.
+    if (rs_z < -1 || (rs_z >= 0 && (uint32_t) rs_z >= size)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty() && cells[i].src >= 0 && cells[i].src != (int32_t) i) {
+            bool referenced = rs_z == (int32_t) i;
+            for (const auto & cell : cells) {
+                if (!cell.is_empty() && (cell.src == (int32_t) i || cell.src0 == (int32_t) i)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) return false;
+        }
+    }
+
+    const uint64_t used_rows64 = uint64_t(used_cells) * groups64;
+    const uint64_t seq_rows64 = uint64_t(seq_cells) * groups64;
+    const uint64_t seq_exclusive_rows64 = uint64_t(seq_exclusive_cells) * groups64;
+    if (used_rows64 > UINT32_MAX || seq_rows64 > UINT32_MAX || seq_exclusive_rows64 > UINT32_MAX) {
+        return false;
+    }
+
+    out.recurrent_known = true;
+    out.recurrent_capacity_rows = (uint32_t) capacity64;
+    out.recurrent_used_rows = (uint32_t) used_rows64;
+    out.recurrent_seq_rows = (uint32_t) seq_rows64;
+    out.recurrent_seq_exclusive_rows = (uint32_t) seq_exclusive_rows64;
+    out.recurrent_rollback_groups = (uint32_t) groups64;
+    return true;
+}
+
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
@@ -815,6 +931,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
+    // Logical CELL_COUNT is NOT silently interpreted as physical recurrent rows.
+    // The engine callback must refuse kind=1 until that layout is derived.
+    io.restore_cells(1, 0, cell_count);
 
     bool res = true;
 
@@ -827,15 +946,14 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     }
 
     if (!res) {
-        if (seq_id == -1) {
-            clear(true);
-        } else {
-            seq_rm(seq_id, -1, -1);
+        if (io.restore_should_cleanup()) {
+            if (seq_id == -1) { clear(true); }
+            else { seq_rm(seq_id, -1, -1); }
         }
         throw std::runtime_error("failed to restore kv cache");
     }
 
-    if (n_rs_seq != 0) {
+    if (!io.validation_only() && n_rs_seq != 0) {
         if (seq_id == -1) {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
         } else {
@@ -948,9 +1066,16 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
 }
 
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
+    // Validate untrusted serialized counts before ubatch/vector allocations or cache mutation.
+    if (cell_count > size) {
+        LLAMA_LOG_ERROR("%s: not enough cells in kv cache (%u > %u)\n", __func__, cell_count, size);
+        return false;
+    }
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        if(!io.validation_only() && !io.destination_precleared()) {
+            io.restore_clear(); seq_rm(dest_seq_id, -1, -1);
+        }
 
         if (cell_count == 0) {
             return true;
@@ -958,6 +1083,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
+        io.restore_allocate();
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 
         for (uint32_t i = 0; i < cell_count; ++i) {
@@ -966,6 +1092,11 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
+
+            if (n_seq_id > n_seq_max) {
+                LLAMA_LOG_ERROR("%s: invalid sequence count %u (max %u)\n", __func__, n_seq_id, n_seq_max);
+                return false;
+            }
 
             if (n_seq_id != 0) {
                 LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
@@ -977,10 +1108,18 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         ubatch.n_seq_id[0] = 1;
         ubatch.seq_id[0] = &dest_seq_id;
 
+        if(io.validation_only()) return true;
+#ifdef LLAMA_B3_CPU_FIXTURES
+        const uint32_t b3_used_before = used;
+#endif
         if (!find_slot(ubatch)) {
             LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
             return false;
         }
+#ifdef LLAMA_B3_CPU_FIXTURES
+        // the planner charges CELL_COUNT cells; prove find_slot occupies exactly that many.
+        GGML_ASSERT(used - b3_used_before == cell_count);
+#endif
 
         // DEBUG CHECK: kv.head should be our first cell, kv.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
         // Assume that this is one contiguous block of cells
@@ -1009,6 +1148,11 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             io.read(&n_seq_id, sizeof(n_seq_id));
 
             cell.pos = pos;
+
+            if (n_seq_id > n_seq_max) {
+                LLAMA_LOG_ERROR("%s: invalid sequence count %u (max %u)\n", __func__, n_seq_id, n_seq_max);
+                return false;
+            }
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
                 llama_seq_id seq_id;

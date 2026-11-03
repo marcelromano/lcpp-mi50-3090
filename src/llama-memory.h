@@ -100,6 +100,17 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // Attention-KV only; derived layouts must explicitly opt in.
+    virtual bool get_seq_capacity(llama_seq_id, llama_memory_seq_capacity & out) const {
+        out = {};
+        return false;
+    }
+
+    virtual bool get_resource_capacity(llama_seq_id, llama_memory_resource_capacity & out) const {
+        out = {};
+        return false;
+    }
+
     //
     // ops
     //

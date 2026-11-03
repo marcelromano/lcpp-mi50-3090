@@ -2203,7 +2203,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else {
-                        res = new llama_memory_hybrid(
+                        auto * mem_hyb = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
@@ -2221,6 +2221,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+
+                        // Qwen3.5/3.6 hybrid: with -kvu the attention layers of both NP2 slots share one pool, so a
+                        // decode ubatch of one slot would otherwise attend the whole span of the other slot's cells
+                        if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                            mem_hyb->get_mem_attn()->set_window(true);
+                        }
+
+                        res = mem_hyb;
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2323,7 +2331,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
+                        auto * kv = new llama_kv_cache(
                                 *this,
                                 hparams,
                                 params.type_k,
@@ -2340,6 +2348,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter,
                                 nullptr,
                                 nullptr);
+
+                        // the Qwen3.5/3.6 MTP head is plain attention over its own cells, so it can take the
+                        // per-sequence KV window like the target's hybrid memory
+                        if (mtp_on_hybrid_qwen35) {
+                            kv->set_window(true);
+                        }
+
+                        res = kv;
                     }
                 }
             }
