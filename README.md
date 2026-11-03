@@ -1,3 +1,28 @@
+# lcpp-mi50-3090
+
+Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) tuned for two GPUs: **NVIDIA RTX 3090 (sm86)** and **AMD Instinct MI50 (gfx906)**. Licensed under MIT, like upstream. Part of the kernels was developed with the help of AI agents.
+
+## Patches on top of upstream
+
+| Patch | Targets | Origin |
+|---|---|---|
+| gfx906 `mul_mat_vec_q` decode kernels (lane-packed rows, DPP reductions, i-quant dot products) | MI50 | Original |
+| Fused decode-time glue kernels (norm + q8_1 quantize, residual add, gates, SwiGLU, top-k MoE) | MI50 | Original |
+| Conv-state step fused into one kernel (concat + conv + SiLU) | MI50 / 3090 | Inspired by the fused conv-state step in [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) |
+| GQA-shared flash-attention decode kernel for quantized KV | MI50 | Original |
+| Quantized-KV GQA flash-attention with int8/f16 MMA, split-K | 3090 | Original |
+| Tensor-core chunked gated delta net (four-term precision option) | 3090 | Helpers adapted from upstream PRs [#29353](https://github.com/ggml-org/llama.cpp/pull/29353) and [#29612](https://github.com/ggml-org/llama.cpp/pull/29612); kernel original |
+| Wave64 decode gated delta net kernel | MI50 | Original |
+| BF16-wire copy-only AllReduce for two-GPU tensor split | MI50 | Original, built on the upstream AllReduce |
+| Penalty + greedy top-k sampling fast path | both | Original |
+| Uninitialized speculative checkpoint buffers | both | Original |
+| Memory resource capacity API, per-sequence KV window, state I/O limits | both | Original |
+| KV admission, restore under admission, slot operations, proxy-cancel fix (server) | both | Original |
+
+Part of the kernels was developed with the help of AI agents. Everything is opt-in at build time (`GGML_EXP_*` macros) or at runtime (environment variables); see the comments at the top of each kernel file. Upstream behavior is the default.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
