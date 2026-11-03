@@ -1,3 +1,4 @@
+#include "../common/common.h"
 #include "../tools/server/kv_planner.hpp"
 #include "../tools/server/kv_resource_view.hpp"
 
@@ -8,6 +9,37 @@
 
 int main() {
     using namespace kvplan;
+
+    // Scope policy shared with the actual dispatch/parser/snapshot paths.
+    CHECK(common_params{}.kv_admission_scope == common_kv_admission_scope::all);
+    CHECK(common_parse_kv_admission_scope("all") == common_kv_admission_scope::all);
+    const auto restore_scope = common_parse_kv_admission_scope("restore");
+    CHECK(common_kv_admission_plain_bypass(restore_scope));
+    CHECK(!common_kv_admission_plain_bypass(common_kv_admission_scope::all));
+    CHECK(common_kv_admission_snapshot_owner_valid(restore_scope, true, false));
+    CHECK(!common_kv_admission_snapshot_owner_valid(common_kv_admission_scope::all, true, false));
+    CHECK(!common_kv_admission_snapshot_owner_valid(restore_scope, false, true));
+    bool invalid_scope = false;
+    try { (void) common_parse_kv_admission_scope("RESTORE"); }
+    catch (const std::invalid_argument &) { invalid_scope = true; }
+    CHECK(invalid_scope);
+    {
+        const ResourceKey rk{Context::target, 0, 7, Kind::recurrent_rows};
+        Snapshot s; s.key = rk; s.known = true; s.capacity = 2; s.used_real = 1;
+        const Owner incoming_restore{7, 2, 1};
+        Planner p;
+        auto plan = p.plan_restore({s}, incoming_restore, {rk});
+        CHECK(plan.kind == RestorePlan::Kind::ok); // active unowned neighbour occupies one real cell
+        CHECK(p.consume_restore(plan.token, rk, 1));
+        CHECK(!p.consume_restore(plan.token, rk, 1)); // no capacity left: fail closed
+        CHECK(p.fence_restore(plan.token));
+        CHECK(p.native_release(incoming_restore).status == Status::accepted);
+        s.used_real = 3;
+        CHECK(p.plan_restore({s}, Owner{7, 3, 1}, {rk}).kind != RestorePlan::Kind::ok);
+        Reservation r; r.owner = incoming_restore; r.peak_by_resource.emplace(rk, 2);
+        s.used_real = 1;
+        CHECK(p.admit({s}, {r}).status == Status::rejected); // old all policy still refuses plain
+    }
 
     // Recurrent rows are bundle counts. Each raw field must be divisible on its own.
     llama_memory_resource_capacity raw{};

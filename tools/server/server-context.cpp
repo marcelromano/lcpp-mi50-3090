@@ -1725,6 +1725,8 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        SRV_INF("KV admission enabled=%d scope=%s\n", params_base.kv_admission,
+                common_kv_admission_scope_name(params_base.kv_admission_scope));
         if (params_base.kv_admission) {
             params_base.cache_ram_mib = 0;
             params_base.cache_idle_slots = false;
@@ -3204,6 +3206,7 @@ private:
         return json {
             {"version", 1},
             {"enabled", params_base.kv_admission},
+            {"scope", common_kv_admission_scope_name(params_base.kv_admission_scope)},
             {"supported", reason.empty()},
             {"scope", kv_admission_mtp_hybrid() ? "mtp_hybrid_target_attention_recurrent_plus_mtp_attention" :
                 (kv_admission_simple_draft() ? "simple_draft_two_attention_contexts" :
@@ -3296,7 +3299,7 @@ private:
                 auto & slot_resources = resource_by_slot[std::make_pair(context.first, slot.id)];
                 const bool active = slot.is_processing();
                 const auto & owner = kv_admission_slot_owners[(size_t) slot.id];
-                if (active != owner.has_value()) {
+                if (!common_kv_admission_snapshot_owner_valid(params_base.kv_admission_scope, active, owner.has_value())) {
                     reason = "native_owner_snapshot_mismatch";
                     return false;
                 }
@@ -3322,7 +3325,7 @@ private:
                         reason = "inconsistent_stream_snapshot";
                         return false;
                     }
-                    if (active) {
+                    if (active && owner.has_value()) {
                         uint64_t total = it->second.seq_exclusive_real;
                         const uint64_t exclusive = capacity.exclusive;
                         if (exclusive > std::numeric_limits<uint64_t>::max() - total) {
@@ -3526,6 +3529,20 @@ private:
                                 const std::vector<server_slot *> & child_slots,
                                 std::string & reason, error_type & error) {
         if (!params_base.kv_admission) return true;
+        if (common_kv_admission_plain_bypass(params_base.kv_admission_scope)) {
+            // Keep L3 fail-closed: parent/child groups must not reach unreserved pools.
+            if (!child_slots.empty()) {
+                reason = "capacity exceeded";
+                error = ERROR_TYPE_KV_CAPACITY;
+                return false;
+            }
+            if (kv_admission_release_failed) {
+                reason = "native_release_ledger_unavailable";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            return true;
+        }
         // A memory getter is metadata only. Fence both real engines at the task boundary
         // before observing either context, and keep dispatch serialized through commit.
         llama_synchronize(ctx_tgt);

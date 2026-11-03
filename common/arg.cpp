@@ -1625,6 +1625,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-admission-scope"}, "{all,restore}",
+        "KV admission scope (default: all; requires --kv-admission to take effect)",
+        [](common_params & params, const std::string & value) {
+            params.kv_admission_scope = common_parse_kv_admission_scope(value);
+        }
+    ).set_env("LLAMA_ARG_KV_ADMISSION_SCOPE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--kv-admission-restore"},
         "enable native KV restore under admission (default: disabled)",
         [](common_params & params) { params.kv_admission_restore = true; }

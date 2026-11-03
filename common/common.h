@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "kv-admission-scope.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -619,6 +620,7 @@ struct common_params {
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
+    common_kv_admission_scope kv_admission_scope = common_kv_admission_scope::all;
     bool    kv_admission_restore = false; // enable native admitted restore
     bool    kv_admission        = false; // guard attention KV growth at server dispatch
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
