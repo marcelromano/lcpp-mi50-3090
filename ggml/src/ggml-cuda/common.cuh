@@ -1473,6 +1473,15 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
+#ifdef GGML_EXP_COLA
+    // : q8_1 activations produced by the fused norm (kept until the next fused norm / end of graph)
+    void *              cola_q8_buf  = nullptr;
+    const ggml_tensor * cola_q8_src1 = nullptr;
+    int64_t             cola_q8_ne0  = 0;
+    int64_t             cola_q8_ne1  = 0;
+    void *              cola_scratch = nullptr;   // completion counter + parked results of the gates kernel
+#endif
+
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {

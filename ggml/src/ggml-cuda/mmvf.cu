@@ -133,7 +133,36 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        int col2_begin = tid;
+#ifdef GGML_EXP_SK_MMVF
+        // : the loop below issues its 2 loads, waits ~1 us of HBM latency, accumulates, and repeats ncols2/block_size
+        // times (8x for the K=2048 router / shared-expert gate). Issue U iterations of loads first, then accumulate
+        // in the same order (bit-identical): the latency is paid once instead of U times.
+        if constexpr (!has_fusion && ncols_dst <= 4) {
+            constexpr int U = ncols_dst == 1 ? 8 : 4;
+            for (; col2_begin + (U - 1)*block_size < ncols2; col2_begin += U*block_size) {
+                float2 xv[U];
+                float2 yv[U][ncols_dst];
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    xv[u] = x2[col2_begin + u*block_size];
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        yv[u][j] = y2[j*stride_col_y2 + col2_begin + u*block_size];
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        ggml_cuda_mad(sumf[j], xv[u].x, yv[u][j].x);
+                        ggml_cuda_mad(sumf[j], xv[u].y, yv[u][j].y);
+                    }
+                }
+            }
+        }
+#endif // GGML_EXP_SK_MMVF
+        for (int col2 = col2_begin; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {

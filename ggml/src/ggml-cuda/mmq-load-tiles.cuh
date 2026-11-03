@@ -1087,6 +1087,38 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(GGML_USE_HIP) && defined(GGML_EXP_MMQ_LDSTAB)
+// exp mq: tabelas de grade das i-quants em LDS (a leitura global dependente do indice custa uma latencia inteira por passo K)
+static __shared__ uint64_t mq_iq2xxs_grid_lds[256];
+static __shared__ uint64_t mq_iq2xs_grid_lds[512];
+static __shared__ uint64_t mq_iq2s_grid_lds[1024];
+static __shared__ uint32_t mq_iq3xxs_grid_lds[256];
+static __shared__ uint32_t mq_iq3s_grid_lds[512];
+#define MQ_IQ2XXS_GRID mq_iq2xxs_grid_lds
+#define MQ_IQ2XS_GRID  mq_iq2xs_grid_lds
+#define MQ_IQ2S_GRID   mq_iq2s_grid_lds
+#define MQ_IQ3XXS_GRID mq_iq3xxs_grid_lds
+#define MQ_IQ3S_GRID   mq_iq3s_grid_lds
+#else
+#define MQ_IQ2XXS_GRID iq2xxs_grid
+#define MQ_IQ2XS_GRID  iq2xs_grid
+#define MQ_IQ2S_GRID   iq2s_grid
+#define MQ_IQ3XXS_GRID iq3xxs_grid
+#define MQ_IQ3S_GRID   iq3s_grid
+#endif
+
+template <ggml_type type> static __device__ __forceinline__ void ggml_cuda_mmq_fill_grid_lds(const int t0, const int nt) {
+#if defined(GGML_USE_HIP) && defined(GGML_EXP_MMQ_LDSTAB)
+    if constexpr (type == GGML_TYPE_IQ2_XXS) { for (int i = t0; i < 256;  i += nt) { mq_iq2xxs_grid_lds[i] = iq2xxs_grid[i]; } }
+    if constexpr (type == GGML_TYPE_IQ2_XS)  { for (int i = t0; i < 512;  i += nt) { mq_iq2xs_grid_lds[i]  = iq2xs_grid[i]; } }
+    if constexpr (type == GGML_TYPE_IQ2_S)   { for (int i = t0; i < 1024; i += nt) { mq_iq2s_grid_lds[i]   = iq2s_grid[i]; } }
+    if constexpr (type == GGML_TYPE_IQ3_XXS) { for (int i = t0; i < 256;  i += nt) { mq_iq3xxs_grid_lds[i] = iq3xxs_grid[i]; } }
+    if constexpr (type == GGML_TYPE_IQ3_S)   { for (int i = t0; i < 512;  i += nt) { mq_iq3s_grid_lds[i]   = iq3s_grid[i]; } }
+#else
+    GGML_UNUSED_VARS(t0, nt);
+#endif
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq2_xxs(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
@@ -1123,7 +1155,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int l = 0; l < QR2_XXS; ++l) {
-            const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
+            const uint2 grid_pos = ((const uint2*)MQ_IQ2XXS_GRID)[aux8[l]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -1186,7 +1218,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     #pragma unroll
         for (int l = 0; l < QR2_XS; ++l) {
-            const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l] & 0x1FF];
+            const uint2 grid_pos = ((const uint2*)MQ_IQ2XS_GRID)[q2[l] & 0x1FF];
             const uint32_t signs = unpack_ksigns(q2[l] >> 9);
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -1255,7 +1287,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int l = 0; l < QR2_S; ++l) {
-            const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+            const int * grid_pos = (const int *)(MQ_IQ2S_GRID + (qs[l] | ((qh << (8-2*l)) & 0x300)));
 
             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
@@ -1320,7 +1352,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
         for (int l = 0; l < QR3_XXS; ++l) {
-            const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
+            const int2 grid_pos = make_int2(MQ_IQ3XXS_GRID[q3[2*l+0]], MQ_IQ3XXS_GRID[q3[2*l+1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -1389,8 +1421,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int l = 0; l < QR3_S; ++l) {
             const int2 grid_pos = make_int2(
-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+                MQ_IQ3S_GRID[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                MQ_IQ3S_GRID[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
 
             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);

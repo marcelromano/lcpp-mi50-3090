@@ -119,6 +119,60 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
 
+#if defined(GGML_USE_HIP) && defined(__gfx906__) && !defined(GGML_NO_GFX906_Q8V)
+    constexpr int NI = I/warp_size;
+    constexpr int NJ = J/nwarps;
+    static_assert(NJ*nwarps == J, "J must be a multiple of nwarps");
+
+#pragma nounroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+
+        int   xq[NI][8];
+        float xd[NI];
+#pragma unroll
+        for (int ii = 0; ii < NI; ++ii) {
+            const int i = ii*warp_size + threadIdx.x;
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                xq[ii][v] = x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0 + v];
+            }
+            xd[ii] = x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + k0/QI8_0];
+        }
+
+        const int   * yq = y_qs + threadIdx.y*MMQ_TILE_Y_K + k0 % MMQ_TILE_NE_K;
+        const float * yd = y_df + threadIdx.y*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1);
+
+        int4  ya = *((const int4 *) (yq));
+        int4  yb = *((const int4 *) (yq + 4));
+        float ys = *yd;
+
+#pragma unroll
+        for (int jj = 0; jj < NJ; ++jj) {
+            const int4  ca = ya;
+            const int4  cb = yb;
+            const float cs = ys;
+            if (jj + 1 < NJ) {
+                ya = *((const int4 *) (yq + (jj + 1)*nwarps*MMQ_TILE_Y_K));
+                yb = *((const int4 *) (yq + (jj + 1)*nwarps*MMQ_TILE_Y_K + 4));
+                ys = yd[(jj + 1)*nwarps*MMQ_TILE_Y_K];
+            }
+#pragma unroll
+            for (int ii = 0; ii < NI; ++ii) {
+                int s = 0;
+                s = ggml_cuda_dp4a(xq[ii][0], ca.x, s);
+                s = ggml_cuda_dp4a(xq[ii][1], ca.y, s);
+                s = ggml_cuda_dp4a(xq[ii][2], ca.z, s);
+                s = ggml_cuda_dp4a(xq[ii][3], ca.w, s);
+                s = ggml_cuda_dp4a(xq[ii][4], cb.x, s);
+                s = ggml_cuda_dp4a(xq[ii][5], cb.y, s);
+                s = ggml_cuda_dp4a(xq[ii][6], cb.z, s);
+                s = ggml_cuda_dp4a(xq[ii][7], cb.w, s);
+                sum[jj*NI + ii] += xd[ii]*cs * ((float) s);
+            }
+        }
+    }
+#else
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
         const int k0 = k00 + k01;
@@ -137,6 +191,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             }
         }
     }
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__) && !defined(GGML_NO_GFX906_Q8V)
 }
 
 template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>

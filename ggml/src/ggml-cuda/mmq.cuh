@@ -3,6 +3,7 @@
 #include "common.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
@@ -217,6 +218,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-ampere.cuh"
 #include "mmq-config-blackwell.cuh"
 
+#include "mmq-config-gcn.cuh"
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
 #include "mmq-config-rdna3.cuh"
@@ -227,6 +229,9 @@ struct ggml_cuda_mmq_config {
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+        }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
             return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
         }
@@ -252,7 +257,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback) {
 #ifdef GGML_USE_HIP
-#ifdef CDNA
+#ifdef GCN
+    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+#elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
 #elif defined(RDNA4)
     return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
@@ -899,7 +906,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+#ifndef GGML_MQ_NOLOAD
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+#endif
+#ifndef GGML_MQ_NOYLOAD
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -909,13 +919,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 tile_y[l] = by0[l];
             }
         }
+#endif
 
         __syncthreads();
 
+#ifndef GGML_MQ_NODOT
         vec_dot(tile_x, tile_y, sum, 0);
+#else
+        sum[0] += tile_x[threadIdx.y*warp_size+threadIdx.x] + tile_y[threadIdx.x];
+#endif
 
         __syncthreads();
 
+#ifndef GGML_MQ_NOYLOAD
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
@@ -925,10 +941,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 tile_y[l] = by0[l];
             }
         }
+#endif
 
         __syncthreads();
 
+#ifndef GGML_MQ_NODOT
         vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+#else
+        sum[0] += tile_x[threadIdx.y*warp_size+threadIdx.x] + tile_y[threadIdx.x];
+#endif
 
         __syncthreads();
     }
@@ -971,6 +992,7 @@ static __global__ void mul_mat_q(
     // For regular matrix multiplications this is never changed.
     // For MoE the correct indices are loaded from ids_dst.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    ggml_cuda_mmq_fill_grid_lds<type>(threadIdx.y*warp_size + threadIdx.x, nwarps*warp_size);
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
         const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
@@ -1475,7 +1497,19 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    int J_hi = 128;
+#if defined(GGML_USE_HIP) && defined(GGML_EXP_MMQ_MOE_J)
+    // exp mq: MoE (ids) em gfx906. ncols_max = n_tokens e um limite superior; o tile real de um expert tem ~n_tokens*n_used/n_experts
+    // colunas. Com J=64 a maioria dos tiles calcula 75% de colunas vazias; limita J ao redor da media por expert.
+    if (args.expert_bounds && cc == GGML_CUDA_CC_VEGA20) {
+        const int64_t avg = args.ncols_dst / (args.nchannels_y > 0 ? args.nchannels_y : 1);
+        const int64_t t_j = (avg*GGML_EXP_MMQ_MOE_J)/8;
+        const int J_moe = (int) ((t_j + 7)/8*8);
+        J_hi = J_moe < 8 ? 8 : (J_moe > 64 ? 64 : J_moe);
+    }
+#endif
+
+    for (int J = 8; J <= J_hi && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -1490,6 +1524,15 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
+        }
+    }
+
+    if (J_best == 120) {
+        // J=120 uses the I=64 tile (more blocks for small ne01); it only wins when I=128 tiles would leave the GPU under half full
+        const int nsm = ggml_cuda_info().devices[id].nsm;
+        const int64_t ntiles_128 = ((args.nrows_x + 127) / 128) * ((args.ncols_max + 127) / 128) * args.nchannels_y * args.nsamples_y;
+        if (ntiles_128 > nsm / 2) {
+            J_best = 128;
         }
     }
 

@@ -9,7 +9,16 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
-    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr
+#ifdef GGML_EXP_Q8_SHARE
+    , const char * src1_q8_1_pre = nullptr
+#endif
+    );
+
+#ifdef GGML_EXP_Q8_SHARE
+// quantizes the shared F32 src1 once and runs n plain MUL_MATs (mmvq) on the same q8_1 buffer
+void ggml_cuda_mul_mat_vec_q_shared_src1(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);
+#endif
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
