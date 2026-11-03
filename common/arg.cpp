@@ -1625,6 +1625,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--kv-admission-scope"}, "{all,restore}",
+        "KV admission scope (default: all; requires --kv-admission to take effect)",
+        [](common_params & params, const std::string & value) {
+            params.kv_admission_scope = common_parse_kv_admission_scope(value);
+        }
+    ).set_env("LLAMA_ARG_KV_ADMISSION_SCOPE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-admission-restore"},
+        "enable native KV restore under admission (default: disabled)",
+        [](common_params & params) { params.kv_admission_restore = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--kv-admission"},
+        "reserve known Transformer attention KV before dispatch (default: disabled)",
+        [](common_params & params) { params.kv_admission = true; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
@@ -1891,6 +1908,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ),
         [](common_params & params) {
             params.spm_infill = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-operation-engine-id"}, "ENGINE_ID",
+        "stable identity for this dedicated model endpoint's slot-operation ledger (required for slot operations)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("slot-operation engine ID must not be empty");
+            }
+            params.slot_operation_engine_id = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -3354,6 +3381,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_API_KEY"));
+    add_opt(common_arg(
+        {"--slot-operation-owner"}, "OWNER",
+        "configured remote proxy principal for slot-operation capability (default: proxy)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("slot-operation owner must not be empty");
+            }
+            params.slot_operation_owner = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--api-key-file"}, "FNAME",
         "path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)",

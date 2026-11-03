@@ -149,6 +149,13 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+# run manually with -m <synthetic hybrid gguf> (gen_synth_hybrid.py)
+llama_build(test-hybrid-state.cpp)
+llama_build_and_test(test-kv-admission-components.cpp ../tools/server/kv_planner.cpp)
+llama_build_and_test(test-kv-admission-restore-plan.cpp ../tools/server/kv_planner.cpp)
+llama_build_and_test(test-kv-admission-restore-bridge.cpp ../tools/server/kv_planner.cpp)
+target_include_directories(test-kv-admission-restore-bridge PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-kv-admission-two-contexts.cpp ../tools/server/kv_planner.cpp ARGS /tmp/test-model.gguf)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -336,3 +343,16 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+llama_build(test-memory-resource-capacity.cpp)
+llama_build(test-recurrent-resource-capacity.cpp)
+target_include_directories(test-recurrent-resource-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-memory-resource-composition.cpp)
+target_include_directories(test-memory-resource-composition PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build_and_test(test-kv-admission-bounded-reader.cpp ARGS /tmp/test-model.gguf ${CMAKE_BINARY_DIR})
+llama_build_and_test(test-kv-admission-r4-r5.cpp ../tools/server/kv_planner.cpp ARGS /tmp/test-model.gguf ${CMAKE_BINARY_DIR})
+
+
+llama_build_and_test(test-kv-admission-recurrent-reader.cpp)
+target_include_directories(test-kv-admission-recurrent-reader PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)

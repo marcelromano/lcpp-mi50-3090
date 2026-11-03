@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "kv-admission-scope.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -13,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <memory>
+#include <type_traits>
 #include <map>
 #include <algorithm>
 #include <fstream>
@@ -617,6 +620,9 @@ struct common_params {
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
+    common_kv_admission_scope kv_admission_scope = common_kv_admission_scope::all;
+    bool    kv_admission_restore = false; // enable native admitted restore
+    bool    kv_admission        = false; // guard attention KV growth at server dispatch
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
@@ -643,6 +649,10 @@ struct common_params {
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;
+    // Remote proxy principal bound to slot-operation requests; not a local backend/device name.
+    std::string slot_operation_owner = "proxy";
+    // Stable identity of this dedicated model endpoint across process epochs.
+    std::string slot_operation_engine_id;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT
@@ -1103,6 +1113,28 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+#ifdef GGML_EXP_CKPT_FAST
+// allocator that default-initializes (leaves trivial types uninitialized) on resize(),
+// avoids zero-filling large checkpoint buffers that are fully overwritten right after
+template <typename T>
+struct common_default_init_allocator : std::allocator<T> {
+    template <typename U> struct rebind { using other = common_default_init_allocator<U>; };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U * p) noexcept(std::is_nothrow_default_constructible<U>::value) {
+        ::new (static_cast<void *>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U * p, Args &&... args) {
+        std::allocator_traits<std::allocator<T>>::construct(*this, p, std::forward<Args>(args)...);
+    }
+};
+
+using common_ckpt_buffer = std::vector<uint8_t, common_default_init_allocator<uint8_t>>;
+#else
+using common_ckpt_buffer = std::vector<uint8_t>;
+#endif
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1112,8 +1144,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_ckpt_buffer data_tgt;
+    common_ckpt_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

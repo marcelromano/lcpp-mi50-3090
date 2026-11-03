@@ -2049,6 +2049,10 @@ server_http_proxy::server_http_proxy(
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
     auto pipe = std::make_shared<server_pipe<msg_t>>();
+    // set by the upstream thread once the request to the child concluded by itself;
+    // cleanup() uses it to tell a normal end from a downstream that went away while the
+    // child is still working (client disconnect, DELETE /v1/stream, window closed)
+    auto upstream_done = std::make_shared<std::atomic<bool>>(false);
 
     if (scheme == "https") {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -2064,7 +2068,14 @@ server_http_proxy::server_http_proxy(
     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
     cli->set_read_timeout(timeout_write, 0);
     this->status = 500; // to be overwritten upon response
-    this->cleanup = [pipe]() {
+    this->cleanup = [pipe, cli, upstream_done]() {
+        // the downstream is gone: abort the upstream request as well. without this the
+        // httplib client stays blocked in send() and the child never learns the request
+        // died, so a mid-prefill cancel only takes effect on the child's next SSE ping
+        // (30 s) and the next request waits for that whole tail (measured on the MI50)
+        if (!upstream_done->load(std::memory_order_acquire)) {
+            cli->stop();
+        }
         pipe->close_read();
         pipe->close_write();
     };
@@ -2169,13 +2180,18 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req]() {
+    this->thread = std::thread([cli, pipe, req, response_handler, upstream_done]() {
         auto result = cli->send(std::move(req));
+        upstream_done->store(true, std::memory_order_release);
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());
             pipe->write({{}, 500, "", ""}); // header
             pipe->write({{}, 0, "proxy error: " + err_str, ""}); // body
+        } else if (result && result->status == 204) {
+            // cpp-httplib skips response_handler for bodyless 204 responses.
+            // Forward ACK headers explicitly instead of keeping default status 500.
+            response_handler(*result);
         }
         pipe->close_write(); // signal EOF to reader
         SRV_DBG("%s", "client request thread ended\n");

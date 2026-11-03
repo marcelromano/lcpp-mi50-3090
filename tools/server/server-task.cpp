@@ -1574,6 +1574,10 @@ json server_task_result_slot_save_load::to_json() {
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+#ifdef LLAMA_EXP_SLOT_DFT
+            { "n_written_dft", n_bytes_dft },
+#endif
+            { "n_checkpoints", n_checkpoints },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1585,6 +1589,10 @@ json server_task_result_slot_save_load::to_json() {
         { "filename",   filename },
         { "n_restored", n_tokens },
         { "n_read",     n_bytes },
+#ifdef LLAMA_EXP_SLOT_DFT
+        { "n_read_dft", n_bytes_dft },
+#endif
+        { "n_checkpoints", n_checkpoints },
         { "timings", {
             { "restore_ms", t_ms }
         }},

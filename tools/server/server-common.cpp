@@ -50,6 +50,14 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "exceed_context_size_error";
             code = 400;
             break;
+        case ERROR_TYPE_KV_CAPACITY:
+            type_str = "kv_capacity_error";
+            code = 503;
+            break;
+        case ERROR_TYPE_KV_UNSUPPORTED:
+            type_str = "kv_admission_unsupported_error";
+            code = 501;
+            break;
     }
     return json {
         {"code", code},

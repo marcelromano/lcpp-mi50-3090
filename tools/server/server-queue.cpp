@@ -210,15 +210,20 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
 void server_queue::cleanup_pending_task(int id_target) {
     // no need lock because this is called exclusively by post()
-    auto rm_func = [id_target](const server_task & task) {
-        return task.id == id_target;
+    auto remove_target = [this, id_target](std::deque<server_task> & tasks) {
+        for (auto it = tasks.begin(); it != tasks.end(); ) {
+            if (it->id == id_target) {
+                if (callback_task_cancelled) {
+                    callback_task_cancelled(*it);
+                }
+                it = tasks.erase(it);
+            } else {
+                ++it;
+            }
+        }
     };
-    queue_tasks.erase(
-        std::remove_if(queue_tasks.begin(),          queue_tasks.end(),          rm_func),
-        queue_tasks.end());
-    queue_tasks_deferred.erase(
-        std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), rm_func),
-        queue_tasks_deferred.end());
+    remove_target(queue_tasks);
+    remove_target(queue_tasks_deferred);
 }
 
 //
