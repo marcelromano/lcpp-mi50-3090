@@ -13,6 +13,57 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
+#if defined(GGML_EXP_SK_TOPK) && defined(GGML_USE_HIP) && defined(__gfx906__)
+#define GGML_SK_TOPK_DPP
+#define GGML_SK_TOPK_MAX_ROWS 16
+//  (GGML_EXP_SK_TOPK): the reductions of this kernel are chains of ds_bpermute (shfl_xor). With one row per
+// token and 8 sequential argmax rounds, ~50 dependent cross-lane round trips set the kernel time (~15 us per call).
+// DPP (quad_perm, row_half_mirror, row_mirror) + one ds_swizzle (lane ^ 16) reduce each 32-lane logical warp
+// without an address round trip. The order used is a total order (value desc, expert index asc), so the winner
+// (and every output) is bit-identical to the shfl_xor version regardless of the reduction tree.
+template <int ctrl>
+static __device__ __forceinline__ int sk_topk_dpp(const int v) {
+    return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xF, 0xF, false);
+}
+
+static __device__ __forceinline__ bool sk_topk_better(const float v, const int e, const float bv, const int be) {
+    return v > bv || (v == bv && e < be);
+}
+
+template <int ctrl>
+static __device__ __forceinline__ void sk_topk_argmax_step(float & v, int & e) {
+    const float ov = __int_as_float(sk_topk_dpp<ctrl>(__float_as_int(v)));
+    const int   oe = sk_topk_dpp<ctrl>(e);
+    if (sk_topk_better(ov, oe, v, e)) {
+        v = ov;
+        e = oe;
+    }
+}
+
+// all-reduce over the 32 lanes of a logical warp (lanes 0-31 or 32-63 of the wave64)
+static __device__ __forceinline__ void sk_topk_argmax32(float & v, int & e) {
+    sk_topk_argmax_step<0xB1>(v, e);  // quad_perm [1,0,3,2]
+    sk_topk_argmax_step<0x4E>(v, e);  // quad_perm [2,3,0,1]
+    sk_topk_argmax_step<0x141>(v, e); // row_half_mirror
+    sk_topk_argmax_step<0x140>(v, e); // row_mirror
+    const float ov = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F)); // lane ^ 16
+    const int   oe = __builtin_amdgcn_ds_swizzle(e, 0x401F);
+    if (sk_topk_better(ov, oe, v, e)) {
+        v = ov;
+        e = oe;
+    }
+}
+
+static __device__ __forceinline__ float sk_topk_max32(float x) {
+    x = fmaxf(x, __int_as_float(sk_topk_dpp<0xB1>(__float_as_int(x))));
+    x = fmaxf(x, __int_as_float(sk_topk_dpp<0x4E>(__float_as_int(x))));
+    x = fmaxf(x, __int_as_float(sk_topk_dpp<0x141>(__float_as_int(x))));
+    x = fmaxf(x, __int_as_float(sk_topk_dpp<0x140>(__float_as_int(x))));
+    x = fmaxf(x, __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x401F)));
+    return x;
+}
+#endif // GGML_EXP_SK_TOPK
+
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
@@ -27,7 +78,12 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
+#ifdef GGML_SK_TOPK_DPP
+    // max is exact in any order; blockDim.y rows share the wave, the reduction stays inside each 32-lane half
+    max_val = sk_topk_max32(max_val);
+#else
     max_val = warp_reduce_max(max_val);
+#endif // GGML_SK_TOPK_DPP
 
     float sum = 0.f;
 
@@ -218,6 +274,12 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                 }
             }
 
+#ifdef GGML_SK_TOPK_DPP
+            if (n_rows <= GGML_SK_TOPK_MAX_ROWS) {
+                sk_topk_argmax32(max_val, max_expert);
+            } else
+#endif // GGML_SK_TOPK_DPP
+            {
 #pragma unroll
             for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
                 const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
@@ -226,6 +288,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                     max_val    = val;
                     max_expert = expert;
                 }
+            }
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {

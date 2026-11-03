@@ -673,6 +673,72 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
 }
 
+#ifdef GGML_EXP_FUSE2
+// two independent L2_NORM nodes (same shape/strides, ncols < 1024) in one launch: channel index
+// [0, nch) is tensor A, [nch, 2*nch) is tensor B. Per-row arithmetic is identical to l2_norm_f32.
+template <int block_size>
+static __global__ void l2_norm2_f32(
+        const float * xa, float * dsta, const float * xb, float * dstb, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y / 2;
+
+    const int row       = blockIdx.x;
+    const bool second   = blockIdx.y >= (unsigned) nchannels;
+    const int channel   = second ? blockIdx.y - nchannels : blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    const float * x = second ? xb   : xa;
+    float *     dst = second ? dstb : dsta;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
+void ggml_cuda_op_l2_norm_x2(ggml_backend_cuda_context & ctx, ggml_tensor * dst_a, ggml_tensor * dst_b) {
+    const ggml_tensor * sa = dst_a->src[0];
+    const ggml_tensor * sb = dst_b->src[0];
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(sa->type == GGML_TYPE_F32 && sb->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst_a->type == GGML_TYPE_F32 && dst_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(sa->ne[0] < 1024 && sa->nb[0] == sizeof(float) && sb->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_are_same_shape(sa, sb));
+    GGML_ASSERT(sa->nb[1] == sb->nb[1] && sa->nb[2] == sb->nb[2] && sa->nb[3] == sb->nb[3]);
+
+    float eps;
+    memcpy(&eps, dst_a->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const dim3 blocks_num(sa->ne[1], 2*sa->ne[2], sa->ne[3]);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(l2_norm2_f32<WARP_SIZE>, launch_params,
+        (const float *) sa->data, (float *) dst_a->data, (const float *) sb->data, (float *) dst_b->data,
+        (int) sa->ne[0], (int64_t) (sa->nb[1]/sizeof(float)), (int64_t) (sa->nb[2]/sizeof(float)),
+        (int64_t) (sa->nb[3]/sizeof(float)), eps);
+}
+#endif // GGML_EXP_FUSE2
+
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
@@ -696,3 +762,175 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+#ifdef GGML_EXP_SK_NORM_FUSE
+#include "unary.cuh"
+
+// : decode-time (few rows) fusions around RMS_NORM+MUL. One block per row; the row is kept in registers
+// (npt values per thread, ncols <= 4*block_size). The reduction is the same block_reduce over the same per-thread
+// partial sums (col = tid, tid + block_size, ...) as rms_norm_f32, and the same expression order for
+// scale * x * w, so the normalized output is bit-identical to the unfused graph.
+//   SK_RMS_ADD : x = a + b                         ; sum = x ; dst = rms(x) * w         (ADD, RMS_NORM, MUL)
+//   SK_RMS_TAIL: x = (a + b * sigmoid(g[row])) + c ; sum = x ; dst = rms(x) * w
+//                (SIGMOID, MUL, ADD, ADD, RMS_NORM, MUL: shared-expert gate + MoE/shexp/residual sum + next norm)
+//   SK_RMS_GATE: x = a                             ; dst = rms(x) * w * silu(b)        (RMS_NORM, MUL, SILU, MUL)
+// __fmul_rn/__fadd_rn pin the rounding of the unfused graph (no FMA contraction of the product into the add).
+enum sk_rms_mode : int { SK_RMS_ADD = 0, SK_RMS_TAIL = 1, SK_RMS_GATE = 2 };
+
+struct sk_rms_args {
+    const float * a;
+    const float * b;
+    const float * c;
+    const float * g;
+    const float * w;
+    float *       sum;
+    float *       dst;
+    int64_t       s_a, s_b, s_c, s_g, s_sum, s_dst; // row strides, in floats
+    float         eps;
+};
+
+template <int block_size, int npt, int mode>
+static __global__ void sk_rms_kernel(const sk_rms_args args, const int ncols) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float * a = args.a + row*args.s_a;
+    const float * b = args.b + row*args.s_b;
+    [[maybe_unused]] const float * c = nullptr;
+    [[maybe_unused]] float sg = 0.0f;
+    if constexpr (mode == SK_RMS_TAIL) {
+        c  = args.c + row*args.s_c;
+        sg = 1.0f / (1.0f + expf(-args.g[row*args.s_g])); // op_sigmoid
+    }
+
+    float xv[npt];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = tid + k*block_size;
+        float v = 0.0f;
+        if (col < ncols) {
+            if constexpr (mode == SK_RMS_ADD) {
+                v = a[col] + b[col];
+            } else if constexpr (mode == SK_RMS_TAIL) {
+                v = __fadd_rn(__fadd_rn(a[col], __fmul_rn(b[col], sg)), c[col]);
+            } else {
+                v = a[col];
+            }
+            if constexpr (mode != SK_RMS_GATE) {
+                args.sum[row*args.s_sum + col] = v;
+            }
+            tmp += v * v;
+        }
+        xv[k] = v;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + args.eps);
+
+#pragma unroll
+    for (int k = 0; k < npt; ++k) {
+        const int col = tid + k*block_size;
+        if (col < ncols) {
+            float o = scale * xv[k] * args.w[col];
+            if constexpr (mode == SK_RMS_GATE) {
+                o = o * ggml_cuda_op_silu_single(b[col]);
+            }
+            args.dst[row*args.s_dst + col] = o;
+        }
+    }
+}
+
+template <int block_size, int mode>
+static void sk_rms_launch_bs(const sk_rms_args & args, const int ncols, const int nrows, cudaStream_t stream) {
+    const int npt = (ncols + block_size - 1) / block_size;
+    const size_t nbytes_shared = 32 * sizeof(float);
+    switch (npt) {
+        case 1: sk_rms_kernel<block_size, 1, mode><<<nrows, block_size, nbytes_shared, stream>>>(args, ncols); break;
+        case 2: sk_rms_kernel<block_size, 2, mode><<<nrows, block_size, nbytes_shared, stream>>>(args, ncols); break;
+        case 3: sk_rms_kernel<block_size, 3, mode><<<nrows, block_size, nbytes_shared, stream>>>(args, ncols); break;
+        case 4: sk_rms_kernel<block_size, 4, mode><<<nrows, block_size, nbytes_shared, stream>>>(args, ncols); break;
+        default: GGML_ABORT("sk_rms: ncols out of range");
+    }
+}
+
+template <int mode>
+static void sk_rms_launch(const sk_rms_args & args, const int ncols, const int nrows, cudaStream_t stream) {
+    GGML_ASSERT(ncols >= 2 && ncols <= 4096);
+    if (ncols < 1024) { // same block size choice as rms_norm_f32_cuda
+        sk_rms_launch_bs<256, mode>(args, ncols, nrows, stream);
+    } else {
+        sk_rms_launch_bs<1024, mode>(args, ncols, nrows, stream);
+    }
+}
+
+static float sk_rms_eps(const ggml_tensor * rms) {
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+    return eps;
+}
+
+static const ggml_tensor * sk_rms_other_src(const ggml_tensor * node, const ggml_tensor * s) {
+    return node->src[0] == s ? node->src[1] : node->src[0];
+}
+
+// ADD(a, b) -> RMS_NORM -> MUL(., w). The ADD result (residual stream) is written too.
+void ggml_cuda_op_sk_add_rms(ggml_backend_cuda_context & ctx, const ggml_tensor * add, const ggml_tensor * rms, const ggml_tensor * mul) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = sk_rms_other_src(mul, rms);
+
+    sk_rms_args args = {};
+    args.a   = (const float *) a->data;  args.s_a   = a->nb[1]/sizeof(float);
+    args.b   = (const float *) b->data;  args.s_b   = b->nb[1]/sizeof(float);
+    args.w   = (const float *) w->data;
+    args.sum = (float *) add->data;      args.s_sum = add->nb[1]/sizeof(float);
+    args.dst = (float *) mul->data;      args.s_dst = mul->nb[1]/sizeof(float);
+    args.eps = sk_rms_eps(rms);
+
+    sk_rms_launch<SK_RMS_ADD>(args, (int) add->ne[0], (int) add->ne[1], ctx.stream());
+}
+
+// SIGMOID(g) -> MUL(x, .) -> ADD(moe, .) -> ADD(., res) -> RMS_NORM -> MUL(., w). Writes the sum (add2) and the normalized output.
+void ggml_cuda_op_sk_ffn_tail(ggml_backend_cuda_context & ctx, const ggml_tensor * sig, const ggml_tensor * mul,
+        const ggml_tensor * add1, const ggml_tensor * add2, const ggml_tensor * rms, const ggml_tensor * mul2) {
+    const ggml_tensor * g   = sig->src[0];
+    const ggml_tensor * x   = sk_rms_other_src(mul, sig);
+    const ggml_tensor * moe = sk_rms_other_src(add1, mul);
+    const ggml_tensor * res = sk_rms_other_src(add2, add1);
+    const ggml_tensor * w   = sk_rms_other_src(mul2, rms);
+
+    sk_rms_args args = {};
+    args.a   = (const float *) moe->data; args.s_a   = moe->nb[1]/sizeof(float);
+    args.b   = (const float *) x->data;   args.s_b   = x->nb[1]/sizeof(float);
+    args.c   = (const float *) res->data; args.s_c   = res->nb[1]/sizeof(float);
+    args.g   = (const float *) g->data;   args.s_g   = g->nb[1]/sizeof(float);
+    args.w   = (const float *) w->data;
+    args.sum = (float *) add2->data;      args.s_sum = add2->nb[1]/sizeof(float);
+    args.dst = (float *) mul2->data;      args.s_dst = mul2->nb[1]/sizeof(float);
+    args.eps = sk_rms_eps(rms);
+
+    sk_rms_launch<SK_RMS_TAIL>(args, (int) add2->ne[0], (int) add2->ne[1], ctx.stream());
+}
+
+// RMS_NORM(x) -> MUL(., w) -> UNARY(SILU)(z) -> MUL(norm, silu(z)); x, z and the output are contiguous, rows = ne1*ne2*ne3.
+void ggml_cuda_op_sk_rms_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,
+        const ggml_tensor * silu, const ggml_tensor * mul2) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * z = silu->src[0];
+    const ggml_tensor * w = sk_rms_other_src(mul, rms);
+
+    sk_rms_args args = {};
+    args.a   = (const float *) x->data; args.s_a   = x->ne[0];
+    args.b   = (const float *) z->data; args.s_b   = z->ne[0];
+    args.w   = (const float *) w->data;
+    args.dst = (float *) mul2->data;    args.s_dst = mul2->ne[0];
+    args.eps = sk_rms_eps(rms);
+
+    sk_rms_launch<SK_RMS_GATE>(args, (int) x->ne[0], (int) (ggml_nelements(x)/x->ne[0]), ctx.stream());
+}
+#endif // GGML_EXP_SK_NORM_FUSE

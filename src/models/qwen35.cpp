@@ -236,9 +236,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, qkv_mixed); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, z); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -268,6 +274,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Qcur_full); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(Qcur_full, "Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
@@ -280,9 +289,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Kcur); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(Kcur, "Kcur", il);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Vcur); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization
@@ -388,15 +403,48 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
+#ifdef GGML_EXP_COLA
+    // ik-style conv chain: keep concat, (view, cpy) x K, ssm_conv, silu contiguous in the node list so the
+    // CUDA backend can run them as one kernel (the kernel reads the state and writes the K snapshots itself)
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+    if (n_seq_tokens <= 8) {
+        ggml_build_forward_expand(gf, conv_output_silu);
+    }
+#endif // GGML_EXP_COLA
+
+#ifdef GGML_EXP_GDN_NOGATHER
+    // no gather: the GDN kernel reads the cell selected by s_copy_main straight from the cache (src[6])
+    const bool gdn_by_ids = n_seqs == 1 && n_seq_tokens <= 8 && cparams.fused_gdn_ar && cparams.fused_gdn_ch;
+    ggml_tensor * state;
+    if (gdn_by_ids) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+            [](ggml_context * c, ggml_tensor * s, ggml_tensor *) {
+                return ggml_view_2d(c, s, s->ne[0], s->ne[1], s->nb[1], 0);
+            });
+        state = ggml_view_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1,
+                head_v_dim*sizeof(float), head_v_dim*head_v_dim*sizeof(float),
+                hparams.n_embd_s()*sizeof(float), 0);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    }
+#else
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+#endif // GGML_EXP_GDN_NOGATHER
+    cb(state, "state_predelta", il);
+
+#ifndef GGML_EXP_COLA
+    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    cb(conv_output_proper, "conv_output_raw", il);
+
+    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    cb(conv_output_silu, "conv_output_silu", il);
+#endif // GGML_EXP_COLA
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -558,6 +606,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "mtp_attn_norm", il);
 
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Qcur_full); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(Qcur_full, "mtp_Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
@@ -577,11 +628,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(gate, "mtp_gate", il);
 
     ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Kcur); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
     ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, Vcur); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
