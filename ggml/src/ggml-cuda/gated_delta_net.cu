@@ -1,5 +1,7 @@
 #include "gated_delta_net.cuh"
+#include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
+#include <cstring>
 
 #ifdef GGML_EXP_GDN_NOGATHER
 // optional src[6]: I32 cell ids; when set, src[5] is a view of the whole recurrent cache and sequence s reads cell state_ids[s]
@@ -515,6 +517,51 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Opt-in backport of upstream #29353. R1 promises ALL last-K snapshots,
+    // unlike the donor's newer final-state-only prefill contract. Compute the
+    // prefix with MMA into slot K-1, then replay the final K-1 tokens with the
+    // unchanged scalar kernel. Single-sequence gating also preserves dst strides.
+    static const bool mma_enabled = [] {
+        const char * e = getenv("GGML_CUDA_GDN_MMA");
+        return e && strcmp(e, "1") == 0;
+    }();
+    const int tail = keep_rs ? K - 1 : 0;
+    const int64_t prefix = n_tokens - tail;
+    if (mma_enabled && !kda && S_v == 128 && neq0 == 128 && n_seqs == 1 && prefix >= 64) {
+#ifdef GGML_EXP_GDN_NOGATHER
+        const int32_t * mma_ids = state_ids;
+#else
+        const int32_t * mma_ids = nullptr;
+#endif
+        float * prefix_state = state_d + tail * state_slot_stride;
+        ggml_cuda_gdn_mma_args args = {
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, prefix_state,
+            H, neqk1, prefix, n_seqs, rq3,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, scale, true, mma_ids,
+        };
+        if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
+            static int logged = 0;
+            if (logged++ < 4) fprintf(stderr, "GDN_MMA_R1 prefix=%lld tail=%d K=%d ids=%d\n",
+                (long long) prefix, tail, K, mma_ids != nullptr);
+            if (tail > 0) {
+                // The prefix snapshot is compact, so input IDs MUST be null here.
+                launch_gated_delta_net<false, true>(
+                    q_d + prefix * sq2, k_d + prefix * sq2, v_d + prefix * sv2,
+                    g_d + prefix * sb2, b_d + prefix * sb2, prefix_state,
+                    dst_d + prefix * S_v * H, state_d,
+                    S_v, H, tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K
+#ifdef GGML_EXP_GDN_NOGATHER
+                    , nullptr
+#endif
+                    , stream);
+            }
+            return;
+        }
+    }
+#endif
 
 #ifdef GGML_EXP_GDN_DEC2
     if (!kda) {
