@@ -572,3 +572,79 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         } break;
     }
 }
+
+#ifdef GGML_EXP_FUSE2
+// MoE aggregation: dst[c,t] = sum_k e[c,k,t]*w[0,k,t] (MUL(experts, weights) followed by the chain of n_used-1 ADDs
+// over the per-expert views) in one kernel. __fmul_rn/__fadd_rn pin the rounding of the unfused graph:
+// ((e0*w0 + e1*w1) + e2*w2) + ..., each product rounded before the add (no FMA contraction).
+struct moe_wsum_args {
+    const float * e;   // down-projection output (MUL src[0]), element strides below
+    const float * w;   // routing weights (MUL src[1])
+    int64_t e_s1, e_s2; // strides of e along expert / token, in floats
+    int64_t w_s1, w_s2; // strides of w along expert / token, in floats
+};
+
+template <int n_used>
+static __global__ void moe_weighted_sum_kernel(const moe_wsum_args args, float * dst, const int64_t n_embd) {
+    ggml_cuda_pdl_lc();
+    const int64_t c = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int64_t t = blockIdx.y;
+    if (c >= n_embd) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    const float * e = args.e + t*args.e_s2 + c;
+    const float * w = args.w + t*args.w_s2;
+
+    float acc = __fmul_rn(e[0], w[0]);
+#pragma unroll
+    for (int k = 1; k < n_used; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(e[k*args.e_s1], w[k*args.w_s1]));
+    }
+    dst[t*n_embd + c] = acc;
+}
+
+template <int n_used>
+static void moe_weighted_sum_launch(const moe_wsum_args & args, float * dst, int64_t n_embd, int64_t n_tokens, cudaStream_t stream) {
+    const int block = 256;
+    const dim3 grid((n_embd + block - 1)/block, n_tokens, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{grid, dim3(block, 1, 1), 0, stream};
+    ggml_cuda_kernel_launch(moe_weighted_sum_kernel<n_used>, launch_params, args, dst, n_embd);
+}
+
+// mul_node: MUL(experts[n_embd,n_used,n_tokens], weights[1,n_used,n_tokens]); dst_node: last ADD of the chain
+void ggml_cuda_op_moe_weighted_sum(ggml_backend_cuda_context & ctx, const ggml_tensor * mul_node, ggml_tensor * dst_node, int n_used) {
+    const ggml_tensor * e = mul_node->src[0];
+    const ggml_tensor * w = mul_node->src[1];
+
+    GGML_ASSERT(e->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(e->nb[0] == sizeof(float) && w->nb[0] == sizeof(float));
+    GGML_ASSERT(w->ne[0] == 1 && w->ne[1] == n_used && e->ne[1] == n_used && e->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(dst_node));
+
+    moe_wsum_args args;
+    args.e    = (const float *) e->data;
+    args.w    = (const float *) w->data;
+    args.e_s1 = e->nb[1]/sizeof(float);
+    args.e_s2 = e->nb[2]/sizeof(float);
+    args.w_s1 = w->nb[1]/sizeof(float);
+    args.w_s2 = w->nb[2]/sizeof(float);
+
+    const int64_t n_embd   = e->ne[0];
+    const int64_t n_tokens = e->ne[2];
+    float * dst = (float *) dst_node->data;
+    cudaStream_t stream = ctx.stream();
+
+    switch (n_used) {
+        case 2: moe_weighted_sum_launch<2>(args, dst, n_embd, n_tokens, stream); break;
+        case 3: moe_weighted_sum_launch<3>(args, dst, n_embd, n_tokens, stream); break;
+        case 4: moe_weighted_sum_launch<4>(args, dst, n_embd, n_tokens, stream); break;
+        case 5: moe_weighted_sum_launch<5>(args, dst, n_embd, n_tokens, stream); break;
+        case 6: moe_weighted_sum_launch<6>(args, dst, n_embd, n_tokens, stream); break;
+        case 7: moe_weighted_sum_launch<7>(args, dst, n_embd, n_tokens, stream); break;
+        case 8: moe_weighted_sum_launch<8>(args, dst, n_embd, n_tokens, stream); break;
+        default: GGML_ABORT("moe_weighted_sum: unsupported n_used");
+    }
+}
+#endif // GGML_EXP_FUSE2

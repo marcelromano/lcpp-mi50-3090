@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-vec-lc.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -573,9 +574,19 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+#ifdef GGML_EXP_FA_LC
+            if (ggml_cuda_flash_attn_ext_vec_lc(ctx, dst)) { // 3..8 tokens (MTP verification): replaces tile + f16 conversion of the whole KV
+                break;
+            }
+#endif // GGML_EXP_FA_LC
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+#ifdef GGML_EXP_FA_LC
+            if (ggml_cuda_flash_attn_ext_vec_lc(ctx, dst)) {
+                break;
+            }
+#endif // GGML_EXP_FA_LC
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
