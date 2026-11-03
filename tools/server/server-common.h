@@ -62,6 +62,8 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    ERROR_TYPE_KV_CAPACITY, // custom admission refusal
+    ERROR_TYPE_KV_UNSUPPORTED, // unsupported admission scope
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

@@ -25,6 +25,7 @@ struct server_context_meta {
     json json_ui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
+    json kv_admission;
 
     // chat params
     server_chat_params & chat_params;
@@ -100,6 +101,16 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
 
+#ifdef LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
+    // Explicit CPU-test fixture. Uses native resource state and public dispatcher requests.
+    bool test_only_populate_draft_sequence(int32_t seq_id, int32_t n_tokens);
+    bool test_only_hybrid_draft_guard();
+    bool test_only_mtp_hybrid_path();
+    bool test_only_recurrent_getter_cases();
+    bool test_only_clear_draft_sequence(int32_t seq_id);
+    void test_only_synchronize_contexts() const;
+#endif
+
     // get a new response reader, used by CLI application
     server_response_reader get_response_reader();
 
@@ -131,6 +142,9 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t get_slot_operations;
+    server_http_context::handler_t get_slot_operation;
+    server_http_context::handler_t post_slot_operation_ack;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

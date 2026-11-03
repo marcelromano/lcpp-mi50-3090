@@ -6,6 +6,8 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <algorithm>
+#include <cctype>
 #include <functional>
 #include <future>
 #include <memory>
@@ -538,6 +540,42 @@ static std::string build_query_string(const httplib::Request & req) {
 using server_http_req_ptr = std::unique_ptr<server_http_req>;
 
 static void process_handler_response(server_http_req_ptr && request, server_http_res_ptr & response, httplib::Response & res) {
+    if (response->status == 204) {
+        res.status = 204;
+        // A 204 response is bodyless. Use an unbounded, non-chunked provider
+        // that finishes without writing so cpp-httplib adds neither a chunk
+        // terminator nor Content-Length: 0. The releaser owns the sole
+        // on_complete call, just as it does for other streamed responses.
+        auto headers = response->headers;
+        for (auto it = headers.begin(); it != headers.end();) {
+            std::string name = it->first;
+            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (name == "transfer-encoding" || name == "content-length" || name == "trailer" ||
+                name == "connection" || name == "keep-alive" || name == "proxy-connection" ||
+                name == "te" || name == "upgrade") {
+                it = headers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        set_headers(res, headers);
+        const std::string content_type = response->content_type;
+        std::shared_ptr<server_http_req> q_ptr = std::move(request);
+        std::shared_ptr<server_http_res> r_ptr = std::move(response);
+        const auto on_complete = [request = q_ptr, response = r_ptr](bool) mutable {
+            response->on_complete();
+            response.reset();
+            request.reset();
+        };
+        res.set_content_provider(content_type, [](size_t, httplib::DataSink & sink) {
+            sink.done();
+            return true;
+        }, on_complete);
+        return;
+    }
+
     if (response->is_stream()) {
         res.status = response->status;
         // Tell Nginx to not buffer any streamed response

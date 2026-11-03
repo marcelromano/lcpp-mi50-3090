@@ -1,9 +1,21 @@
 #include "server-context.h"
+#include <cstdlib>
+
+// CPU integration instrumentation is absent unless explicitly compiled in.
+static const char * kv_admission_cpu_test_env(const char * name) {
+#ifdef LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
+    return getenv(name);
+#else
+    (void) name;
+    return nullptr;
+#endif
+}
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include <cpp-httplib/httplib.h>
 
 #include "arg.h"
 #include "build-info.h"
@@ -12,11 +24,14 @@
 #include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <clocale>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
+#include <future>
+#include <chrono>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -24,6 +39,393 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+#ifdef LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
+// One isolated binding/epoch or no-hook scenario per server process. Identical
+// actor/candidate requests make each arm independently reproducible.
+static int run_kv_admission_c_scenario(int port, server_context & ctx_server, const char * scenario) {
+    const bool binding = std::strcmp(scenario, "binding") == 0 || std::strcmp(scenario, "omit-binding") == 0;
+    const bool epoch = std::strcmp(scenario, "epoch") == 0 || std::strcmp(scenario, "omit-epoch") == 0;
+    const bool hooked = std::strcmp(scenario, "control") != 0 &&
+        std::strcmp(scenario, "omit-binding") != 0 && std::strcmp(scenario, "omit-epoch") != 0;
+    if ((!binding && !epoch && std::strcmp(scenario, "control") != 0) ||
+            !ctx_server.test_only_hybrid_draft_guard()) return 9;
+    const bool b_native = ctx_server.test_only_recurrent_getter_cases();
+    std::fprintf(stderr, "KV_ADMISSION_TEST gate=B-native-result scenario=%s pass=%d\n", scenario, (int)b_native);
+    std::thread dispatcher([&ctx_server]() { ctx_server.start_loop(); });
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(120, 0);
+    client.set_write_timeout(10, 0);
+    bool ready = false;
+    for (int i = 0; i < 200; ++i) {
+        auto health = client.Get("/health");
+        if (health && health->status == 200) { ready = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!ready) { ctx_server.terminate(); dispatcher.join(); return 10; }
+    auto snapshot = [&]() -> std::optional<json> {
+        auto slots = client.Get("/slots");
+        if (!slots || slots->status != 200) return std::nullopt;
+        try { return json::parse(slots->get_header_value("X-KV-Admission-Test-Snapshot")); }
+        catch (...) { return std::nullopt; }
+    };
+    auto actor_future = std::async(std::launch::async, [port]() {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(120, 0);
+        return c.Post("/completion", R"({"prompt":"same-candidate","n_predict":200,"stream":false,"ignore_eos":true,"seed":8,"id_slot":0})", "application/json");
+    });
+    std::optional<json> before;
+    bool actor_owned = false;
+    for (int i = 0; i < 400; ++i) {
+        auto s = snapshot();
+        if (s && s->contains("owners") && !(*s)["owners"].empty()) {
+            for (const auto & owner : (*s)["owners"]) if (owner.value("slot", UINT64_MAX) == 0) actor_owned = true;
+            if (actor_owned) { before = s; break; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if (!actor_owned) { ctx_server.terminate(); dispatcher.join(); return 11; }
+    bool fence_loop_ok = true;
+    for (int i = 0; i < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        auto observed = snapshot();
+        bool found_actor = false;
+        if (observed && before && (*observed)["launch_count"] == (*before)["launch_count"] &&
+                (*observed)["ledger_size"] == (*before)["ledger_size"]) {
+            for (const auto & owner : (*observed)["owners"]) {
+                if (owner.value("slot", UINT64_MAX) == 0 &&
+                        std::find((*before)["owners"].begin(), (*before)["owners"].end(), owner) != (*before)["owners"].end()) found_actor = true;
+            }
+        }
+        fence_loop_ok = fence_loop_ok && found_actor;
+    }
+    if (hooked) setenv("LLAMA_KV_ADMISSION_TEST_FAULT", binding ? "binding" : "epoch", 1);
+    auto candidate = client.Post("/completion", R"({"prompt":"same-candidate","n_predict":2,"stream":false,"ignore_eos":true,"seed":8,"id_slot":1})", "application/json");
+    unsetenv("LLAMA_KV_ADMISSION_TEST_FAULT");
+    const std::string expected = binding ? "invalid exclusive owner/overflow" :
+        (epoch ? "exclusive owner has no commitment on resource" : "");
+    bool checker = false;
+    std::string actual_message;
+    if (candidate) {
+        try {
+            const json body = json::parse(candidate->body);
+            if (body.contains("error") && body["error"].is_object()) actual_message = body["error"].value("message", "");
+        } catch (...) {}
+    }
+    const auto same_refusal_checker = [&]() {
+        return candidate && candidate->status == 503 &&
+            actual_message == std::string("KV admission refused: ") + expected;
+    };
+    if (!expected.empty()) {
+        // Both hooked and omit-hook arms invoke this exact parsed-message checker.
+        checker = same_refusal_checker();
+    } else {
+        checker = candidate && candidate->status == 200;
+    }
+    auto after = snapshot();
+    bool owner_preserved = before && after;
+    if (owner_preserved) {
+        for (const auto & owner : (*before)["owners"]) {
+            if (owner.value("slot", UINT64_MAX) == 0 && std::find((*after)["owners"].begin(), (*after)["owners"].end(), owner) == (*after)["owners"].end()) owner_preserved = false;
+        }
+        if (hooked) owner_preserved = owner_preserved && (*before)["launch_count"] == (*after)["launch_count"] && (*before)["ledger_size"] == (*after)["ledger_size"];
+    }
+    auto actor = actor_future.get();
+    const bool actor_done = actor && actor->status == 200;
+    auto final_state = snapshot();
+    const bool no_leak = final_state && (*final_state)["release_failed"] == false &&
+        (*final_state)["owners"].empty() && (*final_state)["ledger_size"] == 0;
+    std::fprintf(stderr, "KV_ADMISSION_TEST gate=C scenario=%s candidate_status=%d actual_message=\"%s\" checker_exit=%d expected_checker_exit=%d actor_owner_preserved=%d fence_loop=%d actor_status=%d no_release_leak=%d\n",
+        scenario, candidate ? candidate->status : 0, actual_message.c_str(), (int)!checker,
+        (!hooked && !expected.empty()) ? 1 : 0, (int)owner_preserved, (int)fence_loop_ok, actor ? actor->status : 0, (int)no_leak);
+    ctx_server.terminate();
+    dispatcher.join();
+    ctx_server.test_only_synchronize_contexts();
+    const bool control_success = std::strcmp(scenario, "control") == 0 && checker && actor_done && owner_preserved && fence_loop_ok && no_leak;
+    const bool hooked_success = hooked && checker && actor_done && owner_preserved && fence_loop_ok && no_leak;
+    const bool omit_success = !hooked && !expected.empty() && candidate && candidate->status == 200 && !checker && actor_done && owner_preserved && fence_loop_ok && no_leak;
+    return control_success || hooked_success || omit_success ? 0 : 12;
+}
+
+// Independent pressure/control arms use the same actor and exact public candidate.
+// The sole difference is native occupancy of draft stream 1 before dispatch starts.
+static int run_kv_admission_pair_driver(int port, server_context & ctx_server, const char * arm) {
+    const bool pressure = std::strcmp(arm, "pressure") == 0;
+    if (!pressure && std::strcmp(arm, "control") != 0) return 20;
+    if (!ctx_server.test_only_mtp_hybrid_path()) return 21;
+    if (pressure && !ctx_server.test_only_populate_draft_sequence(1, -1)) return 22;
+    std::thread dispatcher([&ctx_server]() { ctx_server.start_loop(); });
+    auto finish = [&]() {
+        ctx_server.terminate();
+        if (dispatcher.joinable()) dispatcher.join();
+        ctx_server.test_only_synchronize_contexts();
+        const bool cleared = ctx_server.test_only_clear_draft_sequence(1);
+        std::fprintf(stderr, "KV_ADMISSION_TEST pair_teardown arm=%s joined=1 synchronized=1 fixture_cleared=%d\n", arm, (int)cleared);
+        return cleared;
+    };
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(120, 0);
+    client.set_write_timeout(10, 0);
+    bool ready = false;
+    for (int i = 0; i < 100; ++i) {
+        auto health = client.Get("/health");
+        if (health && health->status == 200) { ready = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!ready) { finish(); return 23; }
+    auto snapshot = [&]() -> std::optional<json> {
+        auto response = client.Get("/metrics");
+        if (!response || response->status != 200) return std::nullopt;
+        try { return json::parse(response->get_header_value("X-KV-Admission-Test-Snapshot")); }
+        catch (...) { return std::nullopt; }
+    };
+    auto actor_future = std::async(std::launch::async, [port]() {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(120, 0);
+        return c.Post("/completion", R"({"prompt":"One plus one equals","n_predict":200,"temperature":0.8,"top_k":10,"top_p":1.0,"min_p":0.0,"stream":false,"ignore_eos":true,"seed":1938,"id_slot":0})", "application/json");
+    });
+    std::optional<json> before;
+    bool actor_active = false;
+    for (int i = 0; i < 200; ++i) {
+        before = snapshot();
+        if (before && before->contains("owners") && before->at("owners").is_array()) {
+            for (const auto & owner : before->at("owners")) {
+                actor_active = owner.value("slot", UINT64_MAX) == 0 && owner.value("epoch", UINT64_MAX) != 0;
+            }
+        }
+        if (actor_active) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!actor_active || !before) { finish(); return 24; }
+    const auto candidate = client.Post("/completion", R"({"prompt":"hello","n_predict":8,"stream":true,"temperature":0.8,"top_k":10,"top_p":1.0,"min_p":0.0,"ignore_eos":true,"seed":1940,"id_slot":1})", "application/json");
+    auto after_candidate = snapshot();
+    bool candidate_ok = false;
+    bool immutable_refusal = false;
+    bool committed_control = false;
+    if (pressure) {
+        bool json_capacity = false;
+        if (candidate && candidate->status == 503) {
+            try {
+                const auto body = json::parse(candidate->body);
+                json_capacity = body.contains("error") && body["error"].value("type", "") == "kv_capacity_error" &&
+                    body["error"].value("message", "").find("KV admission refused: capacity exceeded") != std::string::npos &&
+                    candidate->get_header_value("Content-Type").find("application/json") != std::string::npos &&
+                    candidate->get_header_value("Content-Type").find("text/event-stream") == std::string::npos &&
+                    candidate->body.find("data:") == std::string::npos;
+            } catch (...) {}
+        }
+        immutable_refusal = json_capacity && after_candidate &&
+            after_candidate->at("owners") == before->at("owners") &&
+            after_candidate->at("launch_count") == before->at("launch_count") &&
+            after_candidate->at("commit_count") == before->at("commit_count") &&
+            after_candidate->at("ledger_size") == before->at("ledger_size");
+        candidate_ok = immutable_refusal;
+    } else {
+        const bool sse = candidate && candidate->status == 200 &&
+            candidate->get_header_value("Content-Type").find("text/event-stream") != std::string::npos &&
+            candidate->body.find("data:") != std::string::npos &&
+            candidate->body.find("\"tokens_predicted\":8") != std::string::npos &&
+            candidate->body.find("\"stop\":true") != std::string::npos;
+        committed_control = sse && after_candidate &&
+            after_candidate->value("commit_count", UINT64_MAX) == before->value("commit_count", UINT64_MAX) + 1 &&
+            after_candidate->value("launch_count", UINT64_MAX) == before->value("launch_count", UINT64_MAX) + 1;
+        bool candidate_owner_released = after_candidate && after_candidate->at("owners").is_array();
+        if (candidate_owner_released) for (const auto & owner : after_candidate->at("owners"))
+            if (owner.value("slot", UINT64_MAX) == 1) candidate_owner_released = false;
+        candidate_ok = committed_control && candidate_owner_released;
+    }
+    auto actor = actor_future.get();
+    int accepted = 0, predicted = 0;
+    bool actor_ok = actor && actor->status == 200;
+    if (actor_ok) try {
+        const auto timings = json::parse(actor->body).at("timings");
+        accepted = timings.value("draft_n_accepted", 0);
+        predicted = timings.value("predicted_n", 0);
+    } catch (...) { actor_ok = false; }
+    auto final_snapshot = snapshot();
+    const bool release_ok = final_snapshot && final_snapshot->at("owners").empty() &&
+        final_snapshot->value("ledger_size", UINT64_MAX) == 0;
+    const bool cleared = finish();
+    std::fprintf(stderr, "KV_ADMISSION_TEST pair arm=%s candidate_status=%d candidate_ok=%d refusal_immutable=%d control_commit_launch=%d actor_status=%d actor_predicted=%d native_accepted=%d actor_ok=%d release_empty=%d cleanup=%d\n",
+        arm, candidate ? candidate->status : 0, (int)candidate_ok, (int)immutable_refusal, (int)committed_control,
+        actor ? actor->status : 0, predicted, accepted, (int)actor_ok, (int)release_ok, (int)cleared);
+    return candidate_ok && actor_ok && predicted == 200 && accepted >= 1 && release_ok && cleared ? 0 : 25;
+}
+
+// Temporary CPU-only integration driver; only present in the isolated test build.
+// It exercises public HTTP routes while the native dispatcher loop is running.
+static int run_kv_admission_test_driver(int port, server_context & ctx_server) {
+    // MTP support is tied to the live target/MTP context pair and its native layouts.
+    if (!ctx_server.test_only_mtp_hybrid_path()) {
+        std::fprintf(stderr, "KV_ADMISSION_TEST driver=FAIL gate=A reason=mtp_hybrid_context_map_discriminant\n");
+        return 8;
+    }
+    // Prepare pressure before any request or dispatcher work can touch the draft context.
+    if (!ctx_server.test_only_populate_draft_sequence(1, -1)) {
+        std::fprintf(stderr, "KV_ADMISSION_TEST driver=FAIL reason=draft_only_decode_fixture_failed\n");
+        return 4;
+    }
+    std::thread dispatcher([&ctx_server]() { ctx_server.start_loop(); });
+    auto stop_and_cleanup_fixture = [&]() {
+        ctx_server.terminate();
+        if (dispatcher.joinable()) dispatcher.join();
+        ctx_server.test_only_synchronize_contexts();
+        const bool cleared = ctx_server.test_only_clear_draft_sequence(1);
+        std::fprintf(stderr, "KV_ADMISSION_TEST teardown joined=1 contexts_synchronized=1 fixture_cleared=%d\n", (int) cleared);
+        return cleared;
+    };
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(2, 0);
+    client.set_read_timeout(15, 0);
+    client.set_write_timeout(10, 0);
+
+    bool ready = false;
+    for (int i = 0; i < 100; ++i) {
+        auto health = client.Get("/health");
+        if (health && health->status == 200) { ready = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!ready) {
+        std::fprintf(stderr, "KV_ADMISSION_TEST driver=FAIL reason=http_not_ready\n");
+        stop_and_cleanup_fixture();
+        return 2;
+    }
+
+    auto actor_future = std::async(std::launch::async, [port]() {
+        httplib::Client actor_client("127.0.0.1", port);
+        actor_client.set_read_timeout(120, 0);
+        return actor_client.Post("/completion", R"({"prompt":"One plus one equals","n_predict":200,"temperature":0.8,"top_k":10,"top_p":1.0,"min_p":0.0,"stream":false,"ignore_eos":true,"seed":1938,"id_slot":0})", "application/json");
+    });
+    auto read_slots_snapshot = [&]() -> std::optional<std::pair<json, json>> {
+        auto slots = client.Get("/slots");
+        if (!slots || slots->status != 200) return std::nullopt;
+        try {
+            json slot_data = json::parse(slots->body);
+            json native_snapshot = json::parse(slots->get_header_value("X-KV-Admission-Test-Snapshot"));
+            return std::make_pair(std::move(slot_data), std::move(native_snapshot));
+        } catch (...) { return std::nullopt; }
+    };
+    auto read_metrics_snapshot = [&]() -> std::optional<json> {
+        auto metrics = client.Get("/metrics");
+        if (!metrics || metrics->status != 200) return std::nullopt;
+        try { return json::parse(metrics->get_header_value("X-KV-Admission-Test-Snapshot")); }
+        catch (...) { return std::nullopt; }
+    };
+    bool actor_active = false;
+    std::optional<json> before_snapshot;
+    for (int i = 0; i < 100; ++i) {
+        const auto metrics_snapshot = read_metrics_snapshot();
+        if (metrics_snapshot && metrics_snapshot->contains("owners") && (*metrics_snapshot)["owners"].is_array()) {
+            for (const auto & owner : (*metrics_snapshot)["owners"]) {
+                if (owner.value("slot", UINT64_MAX) == 0 && owner.value("epoch", UINT64_MAX) != 0 &&
+                        owner.value("task", UINT64_MAX) != 0 && metrics_snapshot->value("launch_count", 0) > 0) {
+                    actor_active = true;
+                    before_snapshot = *metrics_snapshot;
+                }
+            }
+        }
+        if (actor_active) {
+            const auto metrics_snapshot = read_metrics_snapshot();
+            actor_active = metrics_snapshot && metrics_snapshot->at("owners") == before_snapshot->at("owners") &&
+                           metrics_snapshot->at("launch_count") == before_snapshot->at("launch_count");
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!actor_active) {
+        std::fprintf(stderr, "KV_ADMISSION_TEST driver=FAIL reason=prior_actor_not_observed_by_native_metrics_snapshot\n");
+    }
+    httplib::Result denied;
+    if (actor_active) {
+        denied = client.Post("/completion", R"({"prompt":"hello","n_predict":8,"stream":true,"id_slot":1})", "application/json");
+    }
+    bool denied_ok = denied && denied->status == 503;
+    bool typed_capacity_refusal = false;
+    if (denied_ok) {
+        try {
+            const json body = json::parse(denied->body);
+            denied_ok = body.contains("error") && body["error"].value("type", "") == "kv_capacity_error" &&
+                        denied->get_header_value("Content-Type").find("application/json") != std::string::npos &&
+                        denied->get_header_value("Content-Type").find("text/event-stream") == std::string::npos &&
+                        denied->body.find("data:") == std::string::npos;
+            typed_capacity_refusal = body.contains("error") && body["error"].value("message", "").find("KV admission refused: capacity exceeded") != std::string::npos;
+            denied_ok = denied_ok && typed_capacity_refusal;
+        } catch (...) { denied_ok = false; }
+    }
+    const auto after_observation = read_slots_snapshot();
+    const auto metrics_after = read_metrics_snapshot();
+    const bool owner_preserved = before_snapshot && after_observation && metrics_after &&
+        after_observation->second.at("owners") == before_snapshot->at("owners") &&
+        metrics_after->at("owners") == before_snapshot->at("owners") &&
+        after_observation->second.at("launch_count") == before_snapshot->at("launch_count") &&
+        metrics_after->at("launch_count") == before_snapshot->at("launch_count") &&
+        after_observation->second.at("ledger_size") == before_snapshot->at("ledger_size") &&
+        !after_observation->second.at("release_failed").get<bool>();
+    std::fprintf(stderr, "KV_ADMISSION_TEST gate=MTP-draft-pressure status=%d typed_json_503=%d capacity_reason=%d no_sse=%d stream_true=%d owner_exact=%d launch_unchanged=%d ledger_unchanged=%d\n",
+            denied ? denied->status : 0, (int) denied_ok, (int)typed_capacity_refusal,
+            (int)(denied && denied->body.find("data:") == std::string::npos), 1,
+            (int) owner_preserved, (int) owner_preserved, (int)owner_preserved);
+
+    bool fault_gates_ok = true;
+    for (const char * fault : {"unknown", "binding", "epoch"}) {
+        setenv("LLAMA_KV_ADMISSION_TEST_FAULT", fault, 1);
+        auto response = client.Post("/completion", R"({"prompt":"hello","n_predict":8,"stream":false,"id_slot":1})", "application/json");
+        const auto after_fault = read_slots_snapshot();
+        const int expected_status = std::strcmp(fault, "unknown") == 0 ? 501 : 503;
+        const char * expected_reason = std::strcmp(fault, "binding") == 0 ? "invalid exclusive owner/overflow" :
+            (std::strcmp(fault, "epoch") == 0 ? "exclusive owner has no commitment on resource" :
+             (std::strcmp(fault, "unknown") == 0 ? "unknown_memory_resource_snapshot" : "capacity exceeded"));
+        const bool exact_branch_reason = response && response->body.find(std::string("KV admission refused: ") + expected_reason) != std::string::npos;
+        const bool typed_refusal = response && response->status == expected_status &&
+            response->get_header_value("Content-Type").find("application/json") != std::string::npos &&
+            response->body.find("data:") == std::string::npos && exact_branch_reason;
+        const bool fault_owner_preserved = before_snapshot && after_fault &&
+            after_fault->second.at("owners") == before_snapshot->at("owners") &&
+            after_fault->second.at("launch_count") == before_snapshot->at("launch_count") &&
+            after_fault->second.at("ledger_size") == before_snapshot->at("ledger_size");
+        std::fprintf(stderr, "KV_ADMISSION_TEST gate=C branch=%s expected=%s actual_exact=%d status=%d typed_json_refusal=%d owner_exact=%d launch_unchanged=%d ledger_unchanged=%d\n",
+                fault, expected_reason, (int) exact_branch_reason, response ? response->status : 0, (int) typed_refusal,
+                (int) fault_owner_preserved, (int) fault_owner_preserved, (int) fault_owner_preserved);
+        fault_gates_ok = fault_gates_ok && typed_refusal && fault_owner_preserved;
+    }
+    unsetenv("LLAMA_KV_ADMISSION_TEST_FAULT");
+    auto actor = actor_future.get();
+    bool actor_ok = actor && actor->status == 200;
+    int actor_tokens = 0;
+    if (actor_ok) {
+        try { actor_tokens = json::parse(actor->body).at("timings").value("predicted_n", 0); }
+        catch (...) { actor_ok = false; }
+        int accepted_native = 0;
+        try { accepted_native = json::parse(actor->body).at("timings").value("draft_n_accepted", 0); }
+        catch (...) { actor_ok = false; }
+        actor_ok = actor_ok && actor_tokens == 200 && accepted_native >= 1;
+        std::fprintf(stderr, "KV_ADMISSION_TEST gate=MTP-native-acceptance draft_n_accepted=%d required_min=1 pass=%d\n",
+                accepted_native, (int)(accepted_native >= 1));
+    }
+    std::fprintf(stderr, "KV_ADMISSION_TEST driver=prior_actor_completed status=%d predicted_n=%d ok=%d\n",
+            actor ? actor->status : 0, actor_tokens, (int) actor_ok);
+    const char * omitted_hook_expected = "invalid exclusive owner/overflow";
+    const bool omitted_hook_same_reason_assert = actor && actor->status == 503 &&
+        actor->body.find(std::string("KV admission refused: ") + omitted_hook_expected) != std::string::npos;
+    const bool omitted_hook_control = actor_ok && !omitted_hook_same_reason_assert;
+    std::fprintf(stderr, "KV_ADMISSION_TEST gate=C-omit-hook branch=binding expected=%s actual=%s same_assert_result=%s pass=%d\n",
+            omitted_hook_expected, actor_ok ? "accepted" : "not_accepted", omitted_hook_same_reason_assert ? "PASS_UNEXPECTED" : "FAIL_AS_REQUIRED", (int) omitted_hook_control);
+    const bool control_ok = actor_ok; // first accepted native actor is the all-resources-fit completion control
+    std::fprintf(stderr, "KV_ADMISSION_TEST driver=all_resources_fit_control status=%d predicted_n=%d ok=%d\n",
+            actor ? actor->status : 0, actor_tokens, (int) control_ok);
+    const auto after_actor_release = read_metrics_snapshot();
+    const bool actor_release_empty = after_actor_release && after_actor_release->value("ledger_size", UINT64_MAX) == 0 &&
+        after_actor_release->at("owners").empty() && !after_actor_release->value("release_failed", true) &&
+        after_actor_release->value("launch_count", UINT64_MAX) == 1;
+    std::fprintf(stderr, "KV_ADMISSION_TEST gate=MTP-release-after-completion empty_owners=%d ledger_size=%d launch_count=%" PRIu64 "\n",
+            (int)actor_release_empty, after_actor_release ? (int)after_actor_release->value("ledger_size", UINT64_MAX) : -1,
+            after_actor_release ? after_actor_release->value("launch_count", UINT64_MAX) : UINT64_MAX);
+    const bool cleanup_ok = stop_and_cleanup_fixture();
+    return actor_active && denied_ok && owner_preserved && fault_gates_ok && actor_ok && control_ok && actor_release_empty && cleanup_ok ? 0 : 7;
+}
+#endif // LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -222,6 +624,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
+        // Route slot-operation protocol calls to the exact model child selected by `model`.
+        // These endpoints are registered through ctx_http below, so without these overrides
+        // they would execute against the router's empty local registry.
+        routes.get_slot_operations         = models_routes->proxy_get;
+        routes.get_slot_operation          = models_routes->proxy_get;
+        routes.post_slot_operation_ack     = models_routes->proxy_post;
 
         ctx_http.post("/models",               ex_wrapper(models_routes->post_router_models));
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
@@ -271,6 +679,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.get ("/slot-operations",           ex_wrapper(routes.get_slot_operations));
+    ctx_http.get ("/slot-operations/:op_id",    ex_wrapper(routes.get_slot_operation));
+    ctx_http.post("/slot-operations/:op_id/ack", ex_wrapper(routes.post_slot_operation_ack));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h
@@ -506,8 +917,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
             child.notify_to_router(server_state_to_str(SERVER_STATE_READY), routes.get_model_info());
         }
 
-        // this call blocks the main thread until queue_tasks.terminate() is called
+#ifdef LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
+        // The isolated CPU test driver calls the same dispatcher and public HTTP routes.
+        const char * test_driver = kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_DRIVER");
+        const char * pair_arm = kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_PAIR");
+        const char * c_scenario = kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_C_SCENARIO");
+        const int test_driver_status = pair_arm
+            ? run_kv_admission_pair_driver(ctx_http.port, ctx_server, pair_arm)
+            : c_scenario
+            ? run_kv_admission_c_scenario(ctx_http.port, ctx_server, c_scenario)
+            : (test_driver ? run_kv_admission_test_driver(ctx_http.port, ctx_server)
+            : (ctx_server.start_loop(), 0));
+#else
         ctx_server.start_loop();
+#endif
 
         clean_up();
         if (ctx_http.thread.joinable()) {
@@ -516,6 +939,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
         if (monitor_thread.joinable()) {
             monitor_thread.join();
         }
+
+#ifdef LLAMA_KV_ADMISSION_CPU_TEST_DRIVER
+        if (test_driver || pair_arm || c_scenario) return test_driver_status;
+#endif
 
         auto * ll_ctx = ctx_server.get_llama_context();
         if (ll_ctx != nullptr) {

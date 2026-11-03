@@ -27,6 +27,7 @@ private:
 
     // callback functions
     std::function<void(server_task &&)> callback_new_task;
+    std::function<void(const server_task &)> callback_task_cancelled;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
 
@@ -88,6 +89,10 @@ public:
     // Register function to process a new task
     void on_new_task(std::function<void(server_task &&)> callback) {
         callback_new_task = std::move(callback);
+    }
+
+    void on_task_cancelled(std::function<void(const server_task &)> callback) {
+        callback_task_cancelled = std::move(callback);
     }
 
     // Register the function to be called when all slots data is ready to be processed

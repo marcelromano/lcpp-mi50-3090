@@ -14,6 +14,8 @@ add_library(${TARGET} STATIC
     server-common.cpp
     server-common.h
     server-context.cpp
+    kv_planner.cpp
+    kv_planner.hpp
     server-context.h
     server-stream.cpp
     server-stream.h
@@ -63,3 +65,10 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Isolated CPU-only integration build; OFF in production builds.
+option(LLAMA_KV_ADMISSION_CPU_TEST_DRIVER "Compile temporary KV admission CPU test hooks" OFF)
+if (LLAMA_KV_ADMISSION_CPU_TEST_DRIVER)
+    target_compile_definitions(server-context PRIVATE LLAMA_KV_ADMISSION_CPU_TEST_DRIVER)
+    target_compile_definitions(llama-server-impl PRIVATE LLAMA_KV_ADMISSION_CPU_TEST_DRIVER)
+endif()
