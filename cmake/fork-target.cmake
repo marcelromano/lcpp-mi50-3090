@@ -1,0 +1,35 @@
+# Optional, explicit production-source profiles. No profile is selected by default.
+set(LLAMA_FORK_TARGET "" CACHE STRING "Fork profile: rtx3090 or mi50 (empty disables profile)")
+set_property(CACHE LLAMA_FORK_TARGET PROPERTY STRINGS "" rtx3090 mi50)
+option(GGML_CUDA_GDN_MMA_FOUR_TERM "Include the low-low BF16 product in CUDA GDN MMA" OFF)
+
+if (LLAMA_FORK_TARGET)
+    add_compile_definitions(
+        GGML_EXP_CKPT_FAST GGML_EXP_GDN_NOGATHER GGML_EXP_Q8_SHARE GGML_EXP_FUSE2
+        GGML_EXP_SK_MMVF GGML_EXP_SK_FFN_TAIL GGML_EXP_SK_ADD_RMS GGML_EXP_SK_RMS_GATE
+        GGML_EXP_KV_RESTORE_RUNS LLAMA_EXP_SLOT_DFT)
+    set(GGML_NATIVE OFF CACHE BOOL "Portable host build")
+    set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "Single host backend")
+    set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL "Quantized Flash Attention")
+    if (LLAMA_FORK_TARGET STREQUAL "rtx3090")
+        set(GGML_CUDA ON CACHE BOOL "CUDA backend")
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA target")
+        add_compile_definitions(GGML_EXP_MMVQ_V5 GGML_EXP_MMVF_BF16_N8 GGML_EXP_CUDA_FA_KVQ_GQA)
+    elseif (LLAMA_FORK_TARGET STREQUAL "mi50")
+        set(GGML_HIP ON CACHE BOOL "HIP backend")
+        set(AMDGPU_TARGETS gfx906 CACHE STRING "HIP target")
+        add_compile_definitions(
+            GGML_EXP_IQ_LDS GGML_EXP_IQ_LDS2 GGML_EXP_VCMP GGML_EXP_VSUB GGML_EXP_VSUBSS
+            GGML_EXP_GCN_MMVQ_GEOM GGML_EXP_MMVQ_GCN2 GGML_EXP_MMVQ_GCN2_NO_IQ3
+            GGML_EXP_MMVQ_GCN2_IQ3V2 GGML_EXP_GDN_DEC2 GGML_EXP_SK_TOPK GGML_EXP_FA_LC
+            GGML_EXP_MMQ_LDSTAB GGML_EXP_MMQ_J128_IQ GGML_EXP_MMQ_MOE_J=16 GGML_EXP_COLA
+            GGML_EXP_MMVQ_REUSE3 GGML_EXP_MMVQ_DEC_MUL24 GGML_EXP_MMVQ_DEC_Q2K
+            GGML_EXP_MMVQ_DEC_NW=4 GGML_EXP_MMVQ_GCN2_IQ2S_LDS)
+    else()
+        message(FATAL_ERROR "Unknown LLAMA_FORK_TARGET: ${LLAMA_FORK_TARGET}")
+    endif()
+endif()
+
+if (GGML_CUDA_GDN_MMA_FOUR_TERM)
+    add_compile_definitions(GGML_CUDA_GDN_MMA_FOUR_TERM)
+endif()
