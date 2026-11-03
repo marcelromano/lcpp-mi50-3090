@@ -4890,6 +4890,33 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        // Reserve room before the first prompt allocation. Purging only
+                        // after decode fails can leave early batches in the cache tail,
+                        // pinning the attention span at capacity for the whole prompt.
+                        // This runs on the serialized server task thread; never evict
+                        // a processing slot. Count our exclusive cells as reclaimable
+                        // so replacing/reusing a resident prompt does not evict peers.
+                        llama_memory_seq_capacity capacity = {};
+                        auto mem = llama_get_memory(ctx_tgt);
+                        while (params_base.kv_unified &&
+                               llama_memory_get_seq_capacity(mem, slot.id, &capacity) &&
+                               (uint64_t) slot.task->n_tokens() >
+                                   capacity.capacity_cells - capacity.used_cells + capacity.seq_exclusive_cells) {
+                            bool cleared = false;
+                            for (auto & idle : slots) {
+                                if (idle.is_processing() || idle.prompt.n_tokens() == 0) {
+                                    continue;
+                                }
+                                SLT_WRN(slot, "pre-purging idle slot %d before prompt allocation\n", idle.id);
+                                idle.prompt_clear();
+                                cleared = true;
+                                break;
+                            }
+                            if (!cleared) {
+                                break; // active sequences retain the existing retry path
+                            }
+                        }
+
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
