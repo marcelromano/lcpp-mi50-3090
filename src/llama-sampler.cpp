@@ -18,6 +18,9 @@
 #include <numeric>
 #include <random>
 #include <unordered_map>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <stdexcept>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -2693,6 +2696,32 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
+    // fast path: cur_p still indexed by token id (data[id].id == id) -> touch only the penalized tokens
+    // instead of one hash lookup per vocab entry; same result, O(penalty_last_n) instead of O(n_vocab)
+    bool indexed = !cur_p->sorted && ctx->token_count.size() * 8 < cur_p->size;
+    if (indexed) {
+        for (const auto & tc : ctx->token_count) {
+            if (tc.first < 0 || (size_t) tc.first >= cur_p->size || cur_p->data[tc.first].id != tc.first) {
+                indexed = false;
+                break;
+            }
+        }
+    }
+    if (indexed) {
+        for (const auto & tc : ctx->token_count) {
+            auto & td = cur_p->data[tc.first];
+            const int count = tc.second;
+            if (td.logit <= 0) {
+                td.logit *= ctx->penalty_repeat;
+            } else {
+                td.logit /= ctx->penalty_repeat;
+            }
+            td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        }
+        cur_p->sorted = false;
+        return;
+    }
+
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
@@ -2758,6 +2787,67 @@ static struct llama_sampler_i llama_sampler_penalties_i = {
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
 };
+
+llama_token llama_sampler_penalized_argmax(struct llama_sampler * smpl, float * logits, int32_t n_vocab) {
+    struct saved_t { llama_token id; float v; };
+    static thread_local std::vector<saved_t> saved;
+    saved.clear();
+
+    if (smpl) {
+        auto * ctx = (llama_sampler_penalties *) smpl->ctx;
+        if (ctx->penalty_last_n != 0 &&
+            !(ctx->penalty_repeat == 1.0f && ctx->penalty_freq == 0.0f && ctx->penalty_present == 0.0f)) {
+            for (const auto & tc : ctx->token_count) {
+                if (tc.first < 0 || tc.first >= n_vocab) {
+                    continue;
+                }
+                float & l = logits[tc.first];
+                saved.push_back({ tc.first, l });
+                if (l <= 0) {
+                    l *= ctx->penalty_repeat;
+                } else {
+                    l /= ctx->penalty_repeat;
+                }
+                l -= float(tc.second) * ctx->penalty_freq + float(tc.second > 0) * ctx->penalty_present;
+            }
+        }
+    }
+
+    float mx = logits[0];
+    int32_t i = 0;
+#if defined(__SSE2__)
+    {
+        __m128 m0 = _mm_set1_ps(mx), m1 = m0, m2 = m0, m3 = m0;
+        for (; i + 16 <= n_vocab; i += 16) {
+            m0 = _mm_max_ps(m0, _mm_loadu_ps(logits + i));
+            m1 = _mm_max_ps(m1, _mm_loadu_ps(logits + i + 4));
+            m2 = _mm_max_ps(m2, _mm_loadu_ps(logits + i + 8));
+            m3 = _mm_max_ps(m3, _mm_loadu_ps(logits + i + 12));
+        }
+        m0 = _mm_max_ps(_mm_max_ps(m0, m1), _mm_max_ps(m2, m3));
+        float t[4];
+        _mm_storeu_ps(t, m0);
+        mx = std::max(std::max(t[0], t[1]), std::max(t[2], t[3]));
+    }
+#endif
+    for (; i < n_vocab; ++i) {
+        if (logits[i] > mx) {
+            mx = logits[i];
+        }
+    }
+    int32_t best = 0;
+    for (int32_t j = 0; j < n_vocab; ++j) {
+        if (logits[j] == mx) {
+            best = j;
+            break;
+        }
+    }
+
+    for (const auto & sv : saved) {
+        logits[sv.id] = sv.v;
+    }
+    return best;
+}
 
 struct llama_sampler * llama_sampler_init_penalties(
         int32_t penalty_last_n,
