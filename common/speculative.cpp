@@ -171,6 +171,7 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual void clear_state(llama_seq_id /*seq_id*/) {}
 
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
@@ -908,6 +909,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
     }
 
+    void clear_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        pending_pos_last[seq_id] = -1;
+        std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+        verify_g_rows[seq_id] = 0;
+        verify_pos_first[seq_id] = 0;
+    }
+
     bool need_embd() const override {
         return false;
     }
@@ -1279,6 +1288,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+#ifdef LLAMA_EXP_SLOT_DFT
+    // experimental: true once pending_h[seq] holds a real target row (set by process()/set_state())
+    std::vector<char> pending_h_valid;
+#endif
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1359,6 +1373,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+#ifdef LLAMA_EXP_SLOT_DFT
+        pending_h_valid.assign(n_seq, 0);
+#endif
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1512,6 +1530,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+#ifdef LLAMA_EXP_SLOT_DFT
+            pending_h_valid[seq_id] = 1;
+#endif
         }
 
         return true;
@@ -1690,6 +1711,53 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool need_embd_nextn() const override {
         return true;
     }
+
+#ifdef LLAMA_EXP_SLOT_DFT
+    // experimental: the only cross-step state outside ctx_dft is pending_h[seq] - the target hidden row of the
+    // last decoded token, which pairs with the first token of the NEXT process()/draft() call. without it a
+    // restored slot pairs that token with zeros (or with a row left by an unrelated conversation).
+    // blob layout (little-endian host order, same machine class on both ends): i32 n_embd, f32 h[n_embd]
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !pending_h_valid[seq_id]) {
+            return false;
+        }
+
+        const int32_t n = n_embd;
+
+        data.resize(sizeof(int32_t) + (size_t) n * sizeof(float));
+        std::memcpy(data.data(),                    &n,                         sizeof(int32_t));
+        std::memcpy(data.data() + sizeof(int32_t),  pending_h[seq_id].data(),   (size_t) n * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        if (data.size() != sizeof(int32_t) + (size_t) n_embd * sizeof(float)) {
+            return; // not an MTP blob (or a different model): keep the current row
+        }
+
+        int32_t n = 0;
+        std::memcpy(&n, data.data(), sizeof(int32_t));
+        if (n != n_embd) {
+            return;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(int32_t), (size_t) n_embd * sizeof(float));
+        pending_h_valid[seq_id] = 1;
+
+        // verify_h belongs to the verification batch of the previous history; accept() must not copy from it
+        verify_h_rows[seq_id] = 0;
+    }
+
+    void clear_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        pending_h_valid[seq_id] = 0;
+        verify_h_rows[seq_id] = 0;
+    }
+#endif
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2735,6 +2803,18 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+void common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->dparams.size()) return;
+    for (auto & impl : spec->impls) impl->clear_state(seq_id);
+    spec->impl_last[seq_id] = nullptr;
+    auto & dp = spec->dparams[seq_id];
+    dp.drafting = false;
+    dp.n_past = 0;
+    dp.id_last = LLAMA_TOKEN_NULL;
+    dp.prompt = nullptr;
+    if (dp.result) dp.result->clear();
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
