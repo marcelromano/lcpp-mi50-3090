@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <clocale>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
@@ -33,6 +35,90 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
+}
+
+static bool check_resource_observation(llama_context * ctx, const char * stage) {
+    llama_memory_resource_capacity first = {};
+    llama_memory_resource_capacity second = {};
+    std::vector<uint8_t> state_before(llama_state_get_size(ctx));
+    if (llama_state_get_data(ctx, state_before.data(), state_before.size()) != state_before.size()) {
+        fprintf(stderr, "%s: failed to snapshot state before observation at %s\n", __func__, stage);
+        return false;
+    }
+    const bool known = llama_memory_get_resource_capacity(llama_get_memory(ctx), 0, &first, sizeof(first));
+    const bool known_again = llama_memory_get_resource_capacity(llama_get_memory(ctx), 0, &second, sizeof(second));
+    std::vector<uint8_t> state_after(llama_state_get_size(ctx));
+    if (state_after.size() != state_before.size() ||
+            llama_state_get_data(ctx, state_after.data(), state_after.size()) != state_after.size() ||
+            state_before != state_after) {
+        fprintf(stderr, "%s: observation changed serialized state at %s\n", __func__, stage);
+        return false;
+    }
+    const bool same = first.attention_known == second.attention_known &&
+        first.attention_stream_id == second.attention_stream_id &&
+        first.attention_stream_count == second.attention_stream_count &&
+        first.attention_capacity_cells == second.attention_capacity_cells &&
+        first.attention_used_cells == second.attention_used_cells &&
+        first.attention_seq_cells == second.attention_seq_cells &&
+        first.attention_seq_exclusive_cells == second.attention_seq_exclusive_cells &&
+        first.recurrent_known == second.recurrent_known &&
+        first.recurrent_capacity_rows == second.recurrent_capacity_rows &&
+        first.recurrent_used_rows == second.recurrent_used_rows &&
+        first.recurrent_seq_rows == second.recurrent_seq_rows &&
+        first.recurrent_seq_exclusive_rows == second.recurrent_seq_exclusive_rows &&
+        first.recurrent_rollback_groups == second.recurrent_rollback_groups;
+    if (known != known_again || !same) {
+        fprintf(stderr, "%s: resource observation changed between const reads at %s\n", __func__, stage);
+        return false;
+    }
+    if (known) {
+        if (!first.recurrent_known || first.recurrent_rollback_groups != llama_n_rs_seq(ctx) + 1 ||
+                first.recurrent_capacity_rows < first.recurrent_used_rows ||
+                first.recurrent_used_rows < first.recurrent_seq_rows ||
+                first.recurrent_seq_rows < first.recurrent_seq_exclusive_rows) {
+            fprintf(stderr, "%s: invalid recurrent resource observation at %s\n", __func__, stage);
+            return false;
+        }
+        if (first.attention_known &&
+                (first.attention_capacity_cells < first.attention_used_cells ||
+                 first.attention_used_cells < first.attention_seq_cells ||
+                 first.attention_seq_cells < first.attention_seq_exclusive_cells)) {
+            fprintf(stderr, "%s: invalid attention resource observation at %s\n", __func__, stage);
+            return false;
+        }
+    } else if (first.attention_known || first.attention_stream_id || first.attention_stream_count ||
+            first.attention_capacity_cells || first.attention_used_cells || first.attention_seq_cells ||
+            first.attention_seq_exclusive_cells || first.recurrent_known || first.recurrent_capacity_rows ||
+            first.recurrent_used_rows || first.recurrent_seq_rows || first.recurrent_seq_exclusive_rows ||
+            first.recurrent_rollback_groups) {
+        fprintf(stderr, "%s: unknown resource observation was not zeroed at %s\n", __func__, stage);
+        return false;
+    }
+    return true;
+}
+
+static bool check_short_resource_buffer(llama_context * ctx) {
+    llama_memory_resource_capacity short_out;
+    memset(&short_out, 0xA5, sizeof(short_out));
+    const size_t short_size = offsetof(llama_memory_resource_capacity, recurrent_known);
+    if (llama_memory_get_resource_capacity(llama_get_memory(ctx), 0, &short_out, short_size)) {
+        fprintf(stderr, "%s: undersized resource output buffer was accepted\n", __func__);
+        return false;
+    }
+    const unsigned char * bytes = reinterpret_cast<const unsigned char *>(&short_out);
+    for (size_t i = 0; i < short_size; ++i) {
+        if (bytes[i] != 0) {
+            fprintf(stderr, "%s: undersized resource output buffer was not zeroed\n", __func__);
+            return false;
+        }
+    }
+    for (size_t i = short_size; i < sizeof(short_out); ++i) {
+        if (bytes[i] != 0xA5) {
+            fprintf(stderr, "%s: undersized resource output wrote past its size\n", __func__);
+            return false;
+        }
+    }
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -79,6 +165,13 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    if (!check_resource_observation(ctx_src, "empty")) {
+        return 1;
+    }
+    if (!check_short_resource_buffer(ctx_src)) {
+        return 1;
+    }
+
     std::vector<llama_token> tokens;
     if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
         tokens = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
@@ -103,8 +196,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to decode prompt\n", __func__);
         return 1;
     }
+    if (!check_resource_observation(ctx_src, "filled")) {
+        return 1;
+    }
     if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, last_pos, -1)) {
         fprintf(stderr, "%s : rollback failed\n", __func__);
+        return 1;
+    }
+    if (!check_resource_observation(ctx_src, "rollback")) {
         return 1;
     }
 

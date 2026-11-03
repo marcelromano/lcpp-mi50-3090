@@ -9601,6 +9601,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+#ifdef GGML_EXP_FA_LC
+    // exp22 (fattn-vec-lc.cuh): D=256, K/V quantizados (o upstream so cobre quantizado em D=64/72), gqa 4/6/8,
+    // 1..8 tokens (decodificacao e verificacao MTP), kv de 512 a 16384
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t nr2 : { 4, 6, 8 }) {
+            for (int64_t kv : { 512, 4096, 16384 }) {
+                for (int64_t nb : { 1, 2, 3, 6, 8 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nr2 == 6 ? 4 : 2, {nr2, 1}, kv, nb, true, false, 0, 0,
+                                                                    GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+#endif // GGML_EXP_FA_LC
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
