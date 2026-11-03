@@ -1092,6 +1092,10 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     const int64_t   ne   = ggml_nelements(tensors[0]);
     const ggml_type type = tensors[0]->type;
 
+#ifdef GGML_USE_HIP
+    // Copy-only HIP requires F32 graph tensors; the wire is BF16.
+    if (type != GGML_TYPE_F32) { return false; }
+#endif
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
         GGML_LOG_DEBUG("%s: internal unsupported: type=%d\n", __func__, (int) type);
         return false;
