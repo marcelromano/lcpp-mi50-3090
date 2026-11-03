@@ -1,5 +1,27 @@
 # llama.cpp
 
+## Sobre este fork
+
+Fork de [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), voltado a **RTX 3090 (sm_86)** e **AMD MI50 (gfx906)**. A base upstream está fixada em `de699957b92f490efebad149665b0dccf127eaff`; esta não é uma atualização ao master upstream mais recente.
+
+Patches mantidos e suas origens:
+
+- Checkpoints transacionais, admissão KV limitada, restore híbrido e estado especulativo: desenvolvimento original deste fork sobre as APIs upstream.
+- Fusões de decode, quantização compartilhada e sampling rápido: desenvolvimento original sobre os kernels/samplers upstream.
+- Configuração MMQ GCN: backport do [PR upstream #27841](https://github.com/ggml-org/llama.cpp/pull/27841), com extensões locais de MMVQ/IQ/LDS e prefill gfx906.
+- Fusões COLA e convolução recorrente: implementação local, com inspiração em [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) para manter o estado de convolução fora do grafo.
+- Flash Attention KV quantizado/GQA: implementação original; trabalho relacionado, não origem do código: [PR #30792](https://github.com/ggml-org/llama.cpp/pull/30792) e [issue #29935](https://github.com/ggml-org/llama.cpp/issues/29935).
+- GDN MMA chunked: backport do [PR upstream #29353](https://github.com/ggml-org/llama.cpp/pull/29353), com replay de snapshots e variante de quatro termos locais.
+- AllReduce HIP com transporte BF16: implementação local copy-only; relacionada ao [suporte HIP upstream #27825](https://github.com/ggml-org/llama.cpp/pull/27825), sem substituí-lo no caminho CUDA.
+- KV span por sequência, pré-liberação de cauda especulativa e cancelamento correto do proxy: desenvolvimento original deste fork.
+- Perfis de compilação e testes de regressão: integração original deste fork.
+
+Parte dos kernels foi desenvolvida com auxílio de agentes de IA.
+
+A licença MIT do upstream foi preservada. Consulte [docs/FORK.md](docs/FORK.md) para atribuições, compilação e limitações; aprovação de build não equivale a validação numérica ou de produção da combinação.
+
+---
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
