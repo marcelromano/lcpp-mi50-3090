@@ -9601,6 +9601,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+#ifdef GGML_EXP_FA_LC
+    // fattn-vec-lc.cuh: D=256, quantized K/V (upstream only covers quantized at D=64/72), gqa 4/6/8,
+    // 1..8 tokens (decode and MTP verification), kv from 512 to 16384
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int64_t nr2 : { 4, 6, 8 }) {
+            for (int64_t kv : { 512, 4096, 16384 }) {
+                for (int64_t nb : { 1, 2, 3, 6, 8 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nr2 == 6 ? 4 : 2, {nr2, 1}, kv, nb, true, false, 0, 0,
+                                                                    GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+#endif // GGML_EXP_FA_LC
+
+    // Qwen3.8-27B decode / MTP verify on the RTX 3090: D=256, 4 KV heads, GQA=6, K q8_0 / V q4_0.
+    // Covers GGML_EXP_CUDA_FA_KVQ_GQA (nb 1..4, KV >= 512, multiple of 256) and its fallback edges.
+    for (int64_t kv : { 512, 1024, 4096, 8192, 16384, 32768, 65536, 131072 }) {
+        for (int64_t nb : { 1, 2, 3, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        }
+    }
+    for (int64_t nb : { 1, 3 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, false, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)); // no mask
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, true, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)); // sinks -> stock
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3})); // permuted
+    }
+    for (int64_t nb : { 5, 8 }) { // above the dispatch limit -> stock
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 16384, 3, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)); // 2 KV heads
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1000, 3, true, false, 0, 0,
+                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)); // KV % 256 != 0 -> stock
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9662,6 +9705,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // backport: retain every last-K snapshot, including non-aligned prefixes
+    // and strided q/k, not just the donor final state.
+    for (int nt : {64, 65, 66, 67, 127, 512}) {
+        for (int K : {1, 3, 8}) {
+            for (bool permuted : {false, true}) {
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nt, 1, 3, permuted, false, K));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 2, 3, false, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1, 3, false, true, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -10080,6 +10134,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8-27B decode / MTP verify on the RTX 3090 (GGML_EXP_CUDA_FA_KVQ_GQA perf)
+    for (int64_t kv : { 512, 1024, 4096, 8192, 16384, 32768, 65536, 131072 }) {
+        for (int64_t nb : { 1, 2, 3, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        }
+    }
     return test_cases;
 }
 
