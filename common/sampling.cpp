@@ -132,6 +132,30 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
+
+    // fast top-k: only top-k matters when greedy and nothing inspects the rest of the vocabulary.
+    // Returns k (>0) when materialization of all n_vocab entries can be skipped; 0 = standard path.
+    int fast_top_k(int n_vocab) const {
+        if (params.dynatemp_range > 0.0f) return 0;              // dynatemp olha a distribuição inteira
+        if (params.n_probs != 0) return 0;                       // probs por token precisam do vocab inteiro
+        if (grmr != nullptr || rbudget != nullptr) return 0;     // gramática/reasoning budget olham o vocab
+        if (params.dry_multiplier > 0.0f) return 0;
+        if (params.xtc_probability > 0.0f) return 0;
+        if (params.typ_p < 1.0f) return 0;
+        if (params.top_n_sigma >= 0.0f) return 0;
+        if (params.min_p > 0.0f) return 0;
+        if (params.mirostat != 0) return 0;
+        if (!params.logit_bias.empty()) return 0;   // viés de usuário pode PROMOVER token fora do top-k
+        // logit_bias_eog é só a lista pré-calculada de -inf (aplicada via logit_bias quando ignore_eos); inócua aqui
+        if (params.penalty_last_n > 0 &&
+            (params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f)) return 0;
+        for (const auto t : params.samplers) {
+            if (t == COMMON_SAMPLER_TYPE_ADAPTIVE_P || t == COMMON_SAMPLER_TYPE_INFILL) return 0;
+        }
+        if (params.top_k <= 0) return 0;
+        return std::min<int>(params.top_k, n_vocab);
+    }
+
     void set_logits(struct llama_context * ctx, int idx) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
@@ -157,6 +181,32 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+
+            const int k = fast_top_k(n_vocab);
+            if (k > 0) {
+                // seleção do top-k em uma passada (min-heap de tamanho k sobre os logits crus)
+                cur.resize(k);
+                for (int i = 0; i < k; ++i) {
+                    cur[i] = llama_token_data{i, logits[i], 0.0f};
+                }
+                const auto worse = [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit;
+                };
+                std::make_heap(cur.begin(), cur.end(), worse);
+                for (llama_token t = k; t < n_vocab; ++t) {
+                    const float v = logits[t];
+                    if (!(v > cur.front().logit)) {
+                        continue;
+                    }
+                    std::pop_heap(cur.begin(), cur.end(), worse);
+                    cur.back() = llama_token_data{t, v, 0.0f};
+                    std::push_heap(cur.begin(), cur.end(), worse);
+                }
+                std::sort_heap(cur.begin(), cur.end(), worse);   // decrescente
+                cur_p = { cur.data(), cur.size(), -1, true };
+                return;
+            }
+
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
