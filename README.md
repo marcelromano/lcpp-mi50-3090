@@ -20,7 +20,7 @@ Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) tuned for tw
 | Memory resource capacity API, per-sequence KV window, state I/O limits | both | Original |
 | KV admission, restore under admission, slot operations, proxy-cancel fix (server) | both | Original |
 
-Everything is opt-in at build time (`GGML_EXP_*` macros) or at runtime (environment variables); see the comments at the top of each kernel file. Upstream behavior is the default. The exact build flags and runtime arguments used for the numbers below are in [docs/BUILD.md](docs/BUILD.md); experiments that were measured and rejected are in [docs/rejected-experiments.md](docs/rejected-experiments.md).
+Everything is opt-in at build time (`GGML_EXP_*` macros) or at runtime (environment variables); see the comments at the top of each kernel file. Upstream behavior is the default. The exact build flags and runtime arguments used for the numbers below are in [docs/FORK-BUILD.md](docs/FORK-BUILD.md); experiments that were measured and rejected are in [docs/rejected-experiments.md](docs/rejected-experiments.md).
 
 ## Results
 
@@ -28,7 +28,7 @@ All numbers were measured on one host (X99 board, 2x Xeon E5-2673 v3, PCIe 3.0) 
 
 ### Stock vs fork at the published tip
 
-Fork = `publish/master` at `sampling : fast logits path`; stock = upstream llama.cpp at the fork's base commit (`de699957b`). Server runs (`/completion`, `/v1/chat/completions`), 131072-token context allocated, 2 slots, batch/ubatch 512, flash attention on, unified KV, K q8_0 / V q4_0. PP and TG are medians of 3 runs (prompt of exact synthetic tokens; TG is 256 generated tokens); TTFT is for an 8,192-token prompt through the chat endpoint, first call cold and median of the warm calls (warm calls hit the prompt cache, so they measure cache reuse, not prefill). Both builds use the same model files. Full build flags: [docs/BUILD.md](docs/BUILD.md). MTP = the model's multi-token-prediction head used for speculative decoding (n_max=2); stock has no MTP-OFF/ON rows because MTP was not run on it.
+Fork = `publish/master` at `sampling : fast logits path`; stock = upstream llama.cpp at the fork's base commit (`de699957b`). Server runs (`/completion`, `/v1/chat/completions`), 131072-token context allocated, 2 slots, batch/ubatch 512, flash attention on, unified KV, K q8_0 / V q4_0. PP and TG are medians of 3 runs (prompt of exact synthetic tokens; TG is 256 generated tokens); TTFT is for an 8,192-token prompt through the chat endpoint, first call cold and median of the warm calls (warm calls hit the prompt cache, so they measure cache reuse, not prefill). Both builds use the same model files. Full build flags: [docs/FORK-BUILD.md](docs/FORK-BUILD.md). MTP = the model's multi-token-prediction head used for speculative decoding (n_max=2); stock has no MTP-OFF/ON rows because MTP was not run on it.
 
 **RTX 3090 (single GPU, CUDA sm86).** Stock and fork are on the same topology (one card).
 
@@ -54,7 +54,7 @@ Fork vs stock on the same row split: decode +105% without MTP and +137% with MTP
 
 **Parity with the deployed builds.** Before the matrix, the fork build was checked against the deployed binary (27B, MTP on, TG 256, 3 runs): RTX 3090 61.76 vs 62.61 tok/s (-1.36%), 2x MI50 46.70 vs 47.16 tok/s (-0.99%), both inside a +-3% gate. The earlier -3.5% gap on the 3090 came from the missing sampling fast path.
 
-**Hardware and build summary.** One host: X99 board, 2x Xeon E5-2673 v3, PCIe 3.0; RTX 3090 24 GB (270 W limit); 2x MI50 32 GB. CUDA build: GCC 13.3, CUDA 12.8, sm86, `-use_fast_math`, CUDA graphs, FA for all KV quant types, plus the `GGML_EXP_*` opt-ins. HIP build: GCC 13.3, ROCm 7.2.4 (Clang 22), gfx906, FA for all KV quant types, plus the `GGML_EXP_*` opt-ins. Full lists in [docs/BUILD.md](docs/BUILD.md).
+**Hardware and build summary.** One host: X99 board, 2x Xeon E5-2673 v3, PCIe 3.0; RTX 3090 24 GB (270 W limit); 2x MI50 32 GB. CUDA build: GCC 13.3, CUDA 12.8, sm86, `-use_fast_math`, CUDA graphs, FA for all KV quant types, plus the `GGML_EXP_*` opt-ins. HIP build: GCC 13.3, ROCm 7.2.4 (Clang 22), gfx906, FA for all KV quant types, plus the `GGML_EXP_*` opt-ins. Full lists in [docs/FORK-BUILD.md](docs/FORK-BUILD.md).
 
 The depth sweeps and per-patch tables below were measured earlier, on production binaries of their time, and are kept for the per-patch gains and the fidelity data.
 
