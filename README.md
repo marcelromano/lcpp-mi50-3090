@@ -40,7 +40,7 @@ Fork = `publish/master` at `sampling : fast logits path`; stock = upstream llama
 | 35B-A3B | stock, MTP off | 2,343.7 | 3,474.0 | 150.25 | 2.56 s | 23.9 ms |
 | 35B-A3B | fork, MTP off | 2,217.1 | 3,735.9 | 172.88 | 2.36 s | 23.4 ms |
 
-27B decode: +12.7% fork vs stock without MTP, +54.4% with MTP (56.72 vs 36.74 tok/s). 35B-A3B decode +15.1%, PP 8192 +7.5%. Short-prompt prefill (PP 512) is 6.8% (27B) and 5.4% (35B-A3B) lower on the fork than on stock; the fork's prefill gains show up at 8k. These are single runs of 3 per cell; no confidence intervals. The 35B-A3B was not run with MTP in this benchmark (the published IQ4_XS GGUF file has no embedded MTP head; earlier rejected experiments in [docs/rejected-experiments.md](docs/rejected-experiments.md) tested speculation on 35B via a separate draft model / speculative preset).
+27B decode: +12.7% fork vs stock without MTP, +54.4% with MTP (56.72 vs 36.74 tok/s). 35B-A3B decode +15.1%, PP 8192 +7.5%. Short-prompt prefill (PP 512) is 6.8% (27B) and 5.4% (35B-A3B) lower on the fork than on stock; the fork's prefill gains show up at 8k. These are single runs of 3 per cell; no confidence intervals. The 35B-A3B was not run with MTP in this benchmark; in production it is served with its MTP head (`draft-mtp`), and the MTP serving A/B in [docs/rejected-experiments.md](docs/rejected-experiments.md) used that preset.
 
 **2x MI50 (gfx906, ROCm 7.2.4), 27B only. Not the production topology.** Upstream tensor split aborts on gfx906 (a backend assertion), so the stock baseline cannot run the topology the fork is deployed with (tensor split 0.5/0.5). The runs below use row split (`-sm row -ts 1,1`), the configuration the report records for this table; the stock HIP build used the same ROCm toolchain image as the fork (it includes the community rocBLAS gfx906 patches). Treat the numbers as "stock row split vs fork row split", not as stock vs the deployed fork.
 
@@ -135,7 +135,7 @@ Mean KLD vs the F32 wire 0.0015, same-top-p 98.6%. A 20-minute soak (50 requests
 | gfx906 kernels (MI50) | Perplexity vs community build | +0.019% |
 | KV window (MI50) | Greedy output, 12 samples | byte-identical; KLD at A/A floor |
 
-The 35B MoE is not bit-deterministic under concurrent slots and speculation even against itself (16/20 identical greedy sequences between two instances of the same build, as observed in earlier speculative setups; see [docs/rejected-experiments.md](docs/rejected-experiments.md)), so "identical output" is not a usable gate there; KLD and task accuracy are.
+The 35B MoE is not bit-deterministic under concurrent slots and speculation even against itself (16/20 identical greedy sequences between two instances of the same build,), so "identical output" is not a usable gate there; KLD and task accuracy are.
 
 ### Tried and rejected
 
@@ -143,7 +143,7 @@ Experiments that were measured and rejected (fidelity gate, gain within noise, o
 
 ## What it enables
 
-* **Long context on consumer cards.** A 27B at 129k-token context decodes at 53 tok/s on one RTX 3090 (24 GB, K q8_0 / V q4_0 + MTP), against 38 tok/s on the stock build; a 35B-A3B MoE runs across two MI50 cards with 131k allocated context (earlier pre-fork exploratory trials reached 400k).
+* **Long context on consumer cards.** A 27B at 129k-token context decodes at 53 tok/s on one RTX 3090 (24 GB, K q8_0 / V q4_0 + MTP), against 38 tok/s on the stock build; a 35B-A3B MoE is served on two MI50 cards with a 380k-token context allocated (layer split, K/V q8_0, MTP); decode at that depth was not benchmarked here.
 * **Cheap old datacenter GPUs as real inference nodes.** Two MI50 cards (gfx906) serve the 27B at 41 tok/s decode (47 tok/s with MTP) and about 340 tok/s prefill in the row-split benchmark (measured up to 8k context), against 20 tok/s and 184 tok/s on stock under the same split. At 131k tokens of context in layer-split, decode reaches 23.4 tok/s vs 9.3 tok/s on the community build (+151%); tensor split also works where the stock build aborts.
 * **Two slots on one card without the usual penalty.** The per-sequence KV window removes most of the attention cost one slot imposes on the other when they share a unified KV pool.
 * **Safe interactive serving.** Aborting a request mid-prefill frees the slot within a batch instead of after the whole prompt; KV admission and restore limits give a server a hard memory budget per sequence.
