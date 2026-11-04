@@ -40,7 +40,7 @@ Fork = `publish/master` at `sampling : fast logits path`; stock = upstream llama
 | 35B-A3B | stock, MTP off | 2,343.7 | 3,474.0 | 150.25 | 2.56 s | 23.9 ms |
 | 35B-A3B | fork, MTP off | 2,217.1 | 3,735.9 | 172.88 | 2.36 s | 23.4 ms |
 
-27B decode: +12.7% fork vs stock without MTP, +54.4% with MTP (56.72 vs 36.74 tok/s). 35B-A3B decode +15.1%, PP 8192 +7.5%. Short-prompt prefill (PP 512) is 6.8% (27B) and 5.4% (35B-A3B) lower on the fork than on stock; the fork's prefill gains show up at 8k. These are single runs of 3 per cell; no confidence intervals. The 35B-A3B was not run with MTP (no MTP head in that file).
+27B decode: +12.7% fork vs stock without MTP, +54.4% with MTP (56.72 vs 36.74 tok/s). 35B-A3B decode +15.1%, PP 8192 +7.5%. Short-prompt prefill (PP 512) is 6.8% (27B) and 5.4% (35B-A3B) lower on the fork than on stock; the fork's prefill gains show up at 8k. These are single runs of 3 per cell; no confidence intervals. The 35B-A3B was not run with MTP in this benchmark (the published IQ4_XS GGUF file has no embedded MTP head; earlier rejected experiments in [docs/rejected-experiments.md](docs/rejected-experiments.md) tested speculation on 35B via a separate draft model / speculative preset).
 
 **2x MI50 (gfx906, ROCm 7.2.4), 27B only. Not the production topology.** Upstream tensor split aborts on gfx906 (a backend assertion), so the stock baseline cannot run the topology the fork is deployed with (tensor split 0.5/0.5). The runs below use row split (`-sm row -ts 1,1`), the configuration the report records for this table; the stock HIP build used the same ROCm toolchain image as the fork (it includes the community rocBLAS gfx906 patches). Treat the numbers as "stock row split vs fork row split", not as stock vs the deployed fork.
 
@@ -50,7 +50,7 @@ Fork = `publish/master` at `sampling : fast logits path`; stock = upstream llama
 | 27B | fork, row split, MTP off | 338.5 | 379.0 | 40.41 | 22.8 s | 244 ms |
 | 27B | fork, row split, MTP on | 318.3 | 361.9 | 46.61 | 24.0 s | 295 ms |
 
-Fork vs stock on the same row split: decode +105% without MTP and +137% with MTP, PP 8192 +82%, cold 8k TTFT 40.7 s to 22.8 s. The 35B-A3B was not benchmarked against stock on the MI50 cards. The MI50 numbers here come from server runs with 2 slots and 131k context; the layer-split `llama-bench` tables further down use a different method and a different baseline and are not directly comparable to this table.
+Fork vs stock on the same row split: decode +105% without MTP and +137% with MTP, PP 8192 +82%, cold 8k TTFT 40.7 s to 22.8 s. The 35B-A3B was not benchmarked against stock on the MI50 cards. The MI50 numbers here come from server runs with 2 slots and 131k context allocated (measured with prompt sizes up to 8k); the layer-split `llama-bench` tables further down test actual context depths up to 131k tokens (using a different method and baseline, reaching 23.4 vs 9.3 tok/s decode) and are not directly comparable to this table.
 
 **Parity with the deployed builds.** Before the matrix, the fork build was checked against the deployed binary (27B, MTP on, TG 256, 3 runs): RTX 3090 61.76 vs 62.61 tok/s (-1.36%), 2x MI50 46.70 vs 47.16 tok/s (-0.99%), both inside a +-3% gate. The earlier -3.5% gap on the 3090 came from the missing sampling fast path.
 
@@ -77,6 +77,8 @@ The quantized-KV GQA flash-attention kernel does not change prefill (TTFT within
 | 32,768 | 27.4 | 36.8 | +34.2% [33.4, 35.1] |
 | 129,024 | 13.9 | 30.0 | +115% [113, 117] |
 
+On the RTX 3090, the vocabulary projection (Q4_K, 682 MiB, 248k-token vocabulary) already reads at 875 GB/s, 98% of the measured read ceiling of the card, leaving no kernel headroom there (see [docs/rejected-experiments.md](docs/rejected-experiments.md)).
+
 ### RTX 3090: prefill with the tensor-core gated delta net
 
 Production binary with/without the patch (four-term precision option), ABBA, 3 pairs, KV q8_0/q4_0, ubatch 512. Models: Qwen3.8-27B (IQ3_S-based mix) and Qwen3.6-35B-A3B (IQ4_XS).
@@ -99,7 +101,7 @@ Qwen3.8-27B (IQ3_S-based mix, 3.44 bpw). `llama-bench`, layer split 0.5/0.5, bat
 | 32,768 | 320.7 | 363.9 | +13.5% | 15.1 | 28.5 | +88.6% |
 | 131,072 | 225.6 | 249.8 | +10.7% | 9.3 | 23.4 | +151% |
 
-Where the decode gain comes from (ablation at 8k, ratio of means, N=2): disabling the gfx906 i-quant / sub-4-bit `mul_mat_vec_q` kernels costs 21% of decode; disabling the fused glue kernels about 4%; the wave64 GDN decode kernel about 5%. The vocabulary projection (Q4_K, 682 MiB, 248k-token vocabulary) already reads at 875 GB/s, 98% of the measured read ceiling of the card, so there is no kernel headroom left there.
+Where the decode gain comes from (ablation at 8k, ratio of means, N=2): disabling the gfx906 i-quant / sub-4-bit `mul_mat_vec_q` kernels costs 21% of decode; disabling the fused glue kernels about 4%; the wave64 GDN decode kernel about 5%.
 
 Upstream llama.cpp at the base commit aborts on this model with tensor split on gfx906 (an assertion in the backend meta layer), so there is no stock tensor-split baseline.
 
@@ -133,7 +135,7 @@ Mean KLD vs the F32 wire 0.0015, same-top-p 98.6%. A 20-minute soak (50 requests
 | gfx906 kernels (MI50) | Perplexity vs community build | +0.019% |
 | KV window (MI50) | Greedy output, 12 samples | byte-identical; KLD at A/A floor |
 
-The 35B MoE is not bit-deterministic under concurrent slots and speculation even against itself (16/20 identical greedy sequences between two instances of the same build), so "identical output" is not a usable gate there; KLD and task accuracy are.
+The 35B MoE is not bit-deterministic under concurrent slots and speculation even against itself (16/20 identical greedy sequences between two instances of the same build, as observed in earlier speculative setups; see [docs/rejected-experiments.md](docs/rejected-experiments.md)), so "identical output" is not a usable gate there; KLD and task accuracy are.
 
 ### Tried and rejected
 
@@ -141,8 +143,8 @@ Experiments that were measured and rejected (fidelity gate, gain within noise, o
 
 ## What it enables
 
-* **Long context on consumer cards.** A 27B at 129k-token context decodes at 53 tok/s on one RTX 3090 (24 GB, K q8_0 / V q4_0 + MTP), against 38 tok/s on the stock build; a 35B-A3B MoE with 400k-token context runs on two MI50 cards.
-* **Cheap old datacenter GPUs as real inference nodes.** Two MI50 cards (gfx906) serve the 27B at 41 tok/s decode (47 tok/s with MTP) and about 340 tok/s prefill in the row-split benchmark, against 20 tok/s and 184 tok/s on stock under the same split, up to 131k tokens of context; tensor split also works where the stock build aborts.
+* **Long context on consumer cards.** A 27B at 129k-token context decodes at 53 tok/s on one RTX 3090 (24 GB, K q8_0 / V q4_0 + MTP), against 38 tok/s on the stock build; a 35B-A3B MoE runs across two MI50 cards with 131k allocated context (earlier pre-fork exploratory trials reached 400k).
+* **Cheap old datacenter GPUs as real inference nodes.** Two MI50 cards (gfx906) serve the 27B at 41 tok/s decode (47 tok/s with MTP) and about 340 tok/s prefill in the row-split benchmark (measured up to 8k context), against 20 tok/s and 184 tok/s on stock under the same split. At 131k tokens of context in layer-split, decode reaches 23.4 tok/s vs 9.3 tok/s on the community build (+151%); tensor split also works where the stock build aborts.
 * **Two slots on one card without the usual penalty.** The per-sequence KV window removes most of the attention cost one slot imposes on the other when they share a unified KV pool.
 * **Safe interactive serving.** Aborting a request mid-prefill frees the slot within a batch instead of after the whole prompt; KV admission and restore limits give a server a hard memory budget per sequence.
 * **Prefill on one card, decode on another.** KV state files can be moved between engines with identical model identity; see the pool proxy for a 3.6x time-to-first-token improvement for a 79k-token prompt (192 s to 53 s).
