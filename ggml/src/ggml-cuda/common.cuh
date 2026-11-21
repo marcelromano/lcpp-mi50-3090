@@ -1379,6 +1379,13 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    struct uid_key_entry {
+        uint64_t uid = 0;
+        const void * key = nullptr;
+    };
+    static constexpr size_t UID_KEY_CACHE_SIZE = 64;
+    uid_key_entry uid_key_cache[UID_KEY_CACHE_SIZE] = {};
+
     int64_t next_graph_eviction_time = 0;
     int64_t last_graph_use_time = 0;
 

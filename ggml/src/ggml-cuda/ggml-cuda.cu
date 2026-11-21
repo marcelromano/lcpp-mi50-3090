@@ -3229,12 +3229,101 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// small host->device copies (graph inputs, state rows) are staged through a small pinned
+// buffer keyed by the destination and enqueued on the compute stream. The staging buffer of a
+// destination is only overwritten after the caller synchronized the previous consumer of that
+// destination (the scheduler synchronizes the input-copy slot before refilling it), so the source
+// memory can be released as soon as this returns and no per-copy event is needed.
+static constexpr size_t GGML_CUDA_STAGE_MAX_BYTES = 256 * 1024;
+
+struct ggml_cuda_stage_block {
+    void      * ptr = nullptr;
+    size_t      cap = 0;
+};
+
+static void ggml_cuda_stage_copy(void * dst, const void * src, size_t size, cudaStream_t stream) {
+#ifndef GGML_USE_HIP
+    if (size > 0 && size <= GGML_CUDA_STAGE_MAX_BYTES && !ggml_cuda_pinned_memory_disabled()) {
+        static std::mutex mutex;
+        static std::map<void *, ggml_cuda_stage_block> blocks;
+
+        void * stage = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            ggml_cuda_stage_block & block = blocks[dst];
+            if (block.cap < size) {
+                if (block.ptr != nullptr) {
+                    (void) cudaFreeHost(block.ptr);
+                    block.ptr = nullptr;
+                    block.cap = 0;
+                }
+                if (cudaHostAlloc(&block.ptr, size, 0) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    block.ptr = nullptr;
+                } else {
+                    block.cap = size;
+                }
+            }
+            stage = block.ptr;
+        }
+        if (stage != nullptr) {
+            memcpy(stage, src, size);
+            CUDA_CHECK(cudaMemcpyAsync(dst, stage, size, cudaMemcpyHostToDevice, stream));
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream));
+}
+
+static bool ggml_backend_cuda_cpy_tensor_n_async(ggml_backend_t backend, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors) {
+#ifndef GGML_USE_HIP
+    if (n_tensors == 0) {
+        return false;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
+        ggml_backend_buffer_t dst_buf = dsts[i]->view_src ? dsts[i]->view_src->buffer : dsts[i]->buffer;
+        if (src_buf == nullptr || dst_buf == nullptr || !ggml_backend_buffer_is_host(src_buf)) {
+            return false;
+        }
+        if (!ggml_backend_buffer_is_cuda(dst_buf)) {
+            return false;
+        }
+        if (((ggml_backend_cuda_buffer_context *) dst_buf->context)->device != cuda_ctx->device ||
+            !ggml_is_contiguous(srcs[i]) || !ggml_is_contiguous(dsts[i]) ||
+            ggml_nbytes(srcs[i]) != ggml_nbytes(dsts[i])) {
+            return false;
+        }
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    cudaStream_t stream = cuda_ctx->stream();
+    for (size_t i = 0; i < n_tensors; ++i) {
+        ggml_cuda_stage_copy(dsts[i]->data, srcs[i]->data, ggml_nbytes(srcs[i]), stream);
+    }
+
+    return true;
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(srcs);
+    GGML_UNUSED(dsts);
+    GGML_UNUSED(n_tensors);
+    return false;
+#endif // GGML_USE_HIP
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -3385,13 +3474,19 @@ static bool ggml_cuda_graph_pool_enabled() {
     return env && *env && strcmp(env, "0") != 0;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+static const void * ggml_cuda_graph_get_key(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     if (!ggml_cuda_graph_pool_enabled()) {
         return cgraph->nodes[0];
     }
-    // Pool by the complete shape signature (includes token/sequence dimensions
-    // and output count). Addresses are deliberately excluded: node_props still
-    // validates every address before replay. Hash collisions only cause recapture.
+    if (cgraph->uid != 0 && cuda_ctx != nullptr) {
+        const auto & entry = cuda_ctx->uid_key_cache[cgraph->uid % ggml_backend_cuda_context::UID_KEY_CACHE_SIZE];
+        if (entry.uid == cgraph->uid) {
+            return entry.key;
+        }
+    }
+    // Pool by the complete shape + operand-type signature (includes token/sequence
+    // dimensions, output count, and src[*]->type to prevent f16/bf16 collisions).
+    // Addresses are deliberately excluded: node_props validates them before replay.
     uintptr_t key = 1469598103934665603ULL;
     auto mix = [&key](uint64_t value) { key = (key ^ value) * 1099511628211ULL; };
     mix((uint64_t) cgraph->n_nodes);
@@ -3403,14 +3498,31 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
             mix((uint64_t) node->ne[j]);
             mix((uint64_t) node->nb[j]);
         }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const auto * src = node->src[j];
+            if (!src) {
+                continue;
+            }
+            mix((uint64_t) j);
+            mix((uint64_t) src->type);
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                mix((uint64_t) src->ne[d]);
+                mix((uint64_t) src->nb[d]);
+            }
+        }
     }
-    return reinterpret_cast<const void *>(key);
+    const void * ret = reinterpret_cast<const void *>(key);
+    if (cgraph->uid != 0 && cuda_ctx != nullptr) {
+        auto & entry = cuda_ctx->uid_key_cache[cgraph->uid % ggml_backend_cuda_context::UID_KEY_CACHE_SIZE];
+        entry.uid = cgraph->uid;
+        entry.key = ret;
+    }
+    return ret;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const void * graph_key) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3437,12 +3549,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_cuda_graph::node_properties prop = {};
+        ggml_cuda_graph::node_properties prop;
+        memset(&prop, 0, sizeof(prop));
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
                 prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
+                prop.node_src_type[j] = cgraph->nodes[i]->src[j]->type;
                 memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
                 memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
             }
@@ -3531,12 +3645,25 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
-static int ggml_cuda_graph_chunk_size() {
-    static const int chunk_size = [] {
+static int ggml_cuda_graph_chunk_size_for_idx(size_t chunk_idx) {
+    static const int env_chunk_size = [] {
         const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_SIZE");
-        return env != nullptr ? atoi(env) : 512;
+        return env != nullptr ? atoi(env) : -1;
     }();
-    return chunk_size;
+    if (env_chunk_size >= 0) {
+        return env_chunk_size;
+    }
+    static const bool ramp_disabled = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK_RAMP");
+        return env != nullptr && strcmp(env, "0") == 0;
+    }();
+    if (ramp_disabled) {
+        return 512;
+    }
+    // Small first chunk reduces GPU idle time before kernel 0 starts;
+    // larger subsequent chunks reduce total cudaGraphLaunch count while overlapping with GPU.
+    static constexpr int k_ramp[] = { 96, 384, 1536, 4096 };
+    return chunk_idx < 4 ? k_ramp[chunk_idx] : 4096;
 }
 
 // end the capture of chunk `idx`, update or create its executable and launch it
@@ -5409,8 +5536,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
-    const int         chunk_size = ggml_cuda_graph_chunk_size();
-    int               chunk_end  = chunk_size;
+    int               chunk_end  = ggml_cuda_graph_chunk_size_for_idx(0);
     size_t            n_chunks   = 0;
 #endif // USE_CUDA_GRAPH
 
@@ -5506,10 +5632,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
                 // fused nodes are skipped together, so a cut never splits a fusion
                 // a concurrent region must join before its capture can end
-                if (use_cuda_graph && chunk_size > 0 && i >= chunk_end && !is_concurrent_event_active) {
+                if (use_cuda_graph && chunk_end > 0 && i >= chunk_end && !is_concurrent_event_active) {
                     ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
                     CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
-                    chunk_end = i + chunk_size;
+                    const int next_sz = ggml_cuda_graph_chunk_size_for_idx(n_chunks);
+                    chunk_end = next_sz > 0 ? i + next_sz : 0;
                 }
 #endif // USE_CUDA_GRAPH
                 if (is_concurrent_event_active) {
@@ -5653,7 +5780,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     if (cuda_ctx->outer_graph_depth == 0) {
-        graph_key = ggml_cuda_graph_get_key(cgraph);
+        graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
 
         ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -5664,7 +5791,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
             if (graph_compatible) {
                 const bool pool_warmed = ggml_cuda_graph_pool_enabled() && !graph->node_props.empty();
-                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+                const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph, graph_key);
 
                 if (!graph->warmup_complete) {
                     // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5898,7 +6025,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const void * graph_key = ggml_cuda_graph_get_key(cuda_ctx, cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -6157,6 +6284,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .cpy_tensor_n_async      = */ ggml_backend_cuda_cpy_tensor_n_async,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

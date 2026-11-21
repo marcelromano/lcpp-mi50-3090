@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-ring.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1105,6 +1106,109 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+
+template <ggml_type type, int c_ncols_dst, int rows_per_block, int nwarps, bool use_smem_grid, int nstages = 2, int preload = 0, bool flat_load = false>
+static void mul_mat_vec_q_contig_ring_launch_cfg(
+        const void * vx, const void * vy, float * dst,
+        const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_dst, const uint3 channel_ratio_fd, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio_fd, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        cudaStream_t stream) {
+    constexpr int min_blk = 1;
+    constexpr int smem = mmvq_contig_ring_smem_bytes<type, c_ncols_dst, rows_per_block, nwarps, nstages, use_smem_grid>();
+    const int nblocks = (nrows_x + rows_per_block - 1) / rows_per_block;
+    const dim3 block_nums(nblocks, nchannels_dst, nsamples_dst);
+    const dim3 block_dims(32, nwarps, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, smem, stream);
+    ggml_cuda_kernel_launch(
+        mul_mat_vec_q_contig_ring<type, c_ncols_dst, rows_per_block, nwarps, nstages, use_smem_grid, min_blk, preload, flat_load>, launch_params,
+        vx, vy, dst,
+        (uint32_t)ncols_x, (uint32_t)nrows_x,
+        (uint32_t)stride_row_x, (uint32_t)stride_col_y, (uint32_t)stride_col_dst,
+        channel_ratio_fd, (uint32_t)stride_channel_x, (uint32_t)stride_channel_y, (uint32_t)stride_channel_dst,
+        sample_ratio_fd, (uint32_t)stride_sample_x, (uint32_t)stride_sample_y, (uint32_t)stride_sample_dst);
+}
+
+template <ggml_type type, int c_ncols_dst>
+static void mul_mat_vec_q_contig_ring_launch(
+        const void * vx, const void * vy, float * dst,
+        const int ncols_x, const int nrows_x,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_dst, const uint3 channel_ratio_fd, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio_fd, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        cudaStream_t stream) {
+    constexpr bool use_smem_grid = (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS);
+    if constexpr (type == GGML_TYPE_Q4_K && c_ncols_dst == 1) {
+        mul_mat_vec_q_contig_ring_launch_cfg<type, c_ncols_dst, 8, 2, false, 2, 256, true>(
+            vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+            nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+            nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+        return;
+    } else if constexpr (type == GGML_TYPE_IQ3_S) {
+        if (c_ncols_dst > 1 && nrows_x == 6144) {
+            mul_mat_vec_q_contig_ring_launch_cfg<type, c_ncols_dst, 4, 1, use_smem_grid>(
+                vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+            return;
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        if (nrows_x <= 5120 && ncols_x <= 6144) {
+            mul_mat_vec_q_contig_ring_launch_cfg<type, c_ncols_dst, 4, 1, use_smem_grid>(
+                vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+            return;
+        }
+    }
+    mul_mat_vec_q_contig_ring_launch_cfg<type, c_ncols_dst, 8, 1, use_smem_grid>(
+        vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+        nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+        nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream);
+}
+
+template <ggml_type type>
+static bool mul_mat_vec_q_contig_ring_try(
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const int ncols_x, const int nrows_x, const int ncols_dst,
+        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const int nchannels_dst, const uint3 channel_ratio_fd, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int nsamples_dst, const uint3 sample_ratio_fd, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const int cc, cudaStream_t stream) {
+    if constexpr (!mmvq_opt_type_supported<type>()) {
+        return false;
+    } else {
+        if (ids != nullptr) {
+            return false;
+        }
+        if (fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.shared_up != nullptr) {
+            return false;
+        }
+        if (!GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+            return false;
+        }
+        if (((uintptr_t)vx & 15) != 0 || ncols_x < QK_K || (ncols_x % QK_K) != 0) {
+            return false;
+        }
+        if (ncols_dst == 1 && type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K && type != GGML_TYPE_IQ3_S) {
+            return false;
+        }
+        switch (ncols_dst) {
+            case 1: mul_mat_vec_q_contig_ring_launch<type, 1>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 2: mul_mat_vec_q_contig_ring_launch<type, 2>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 3: mul_mat_vec_q_contig_ring_launch<type, 3>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 4: mul_mat_vec_q_contig_ring_launch<type, 4>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 5: mul_mat_vec_q_contig_ring_launch<type, 5>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 6: mul_mat_vec_q_contig_ring_launch<type, 6>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 7: mul_mat_vec_q_contig_ring_launch<type, 7>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            case 8: mul_mat_vec_q_contig_ring_launch<type, 8>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, stream); return true;
+            default: return false;
+        }
+    }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1202,6 +1306,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+        return;
+    }
+
+    if (mul_mat_vec_q_contig_ring_try<type>(
+            vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst,
+            stride_row_x, stride_col_y, stride_col_dst,
+            nchannels_dst, channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+            nsamples_dst, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+            cc, stream)) {
         return;
     }
 
