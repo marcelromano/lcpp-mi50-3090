@@ -124,6 +124,9 @@ struct common_sampler {
 
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
+    // Stateless device prefix only; all CPU transforms and the seeded RNG stay
+    // on the original chain and run only for rows actually visited by verify.
+    llama_sampler * device_topk = nullptr;
 
     void reset() {
         prev.clear();
@@ -454,6 +457,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
     llama_sampler_free(gsmpl->chain);
+    llama_sampler_free(gsmpl->device_topk);
 
     delete gsmpl;
 }
@@ -601,6 +605,49 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     }
 
     return gsmpl->chain;
+}
+
+struct llama_sampler * common_sampler_get_device_topk(struct common_sampler * gsmpl, int n_vocab) {
+    const char * env = std::getenv("LLAMA_SPEC_DEVICE_TOPK");
+    if (!gsmpl || !env || !*env || std::strcmp(env, "0") == 0) {
+        return nullptr;
+    }
+    const auto & params = gsmpl->params;
+    // Only idempotent -inf masks (ignore_eos) can be applied twice safely.
+    for (const auto & bias : params.logit_bias) {
+        if (bias.bias != -INFINITY) {
+            return nullptr;
+        }
+    }
+    const int k = params.top_k <= 0 ? n_vocab : params.top_k;
+    bool seen_topk = false;
+    for (int j = 0; j < llama_sampler_chain_n(gsmpl->chain); ++j) {
+        const std::string name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, j));
+        if (name == "top-k") {
+            seen_topk = true;
+            break;
+        }
+        if (name == "logit-bias" || name == "penalties" || (!name.empty() && name[0] == '?')) {
+            continue;
+        }
+        return nullptr; // an earlier distribution transform needs the full vocabulary
+    }
+    if (!seen_topk) {
+        return nullptr;
+    }
+    const int prefilter_k = k + (int) params.logit_bias.size();
+    if (k <= 0 || prefilter_k > 64 || prefilter_k >= n_vocab) {
+        return nullptr;
+    }
+    if (!gsmpl->device_topk) {
+        gsmpl->device_topk = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        // Empty bias is a marker, with NO per-row backend inputs/state. Fetch
+        // enough extra candidates for every -inf CPU mask; never apply it twice.
+        llama_sampler_chain_add(gsmpl->device_topk, llama_sampler_init_logit_bias(n_vocab, 0, nullptr));
+        // Extra candidate detects a boundary tie. CPU masks then truncates to k.
+        llama_sampler_chain_add(gsmpl->device_topk, llama_sampler_init_top_k(prefilter_k + 1));
+    }
+    return gsmpl->device_topk;
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {

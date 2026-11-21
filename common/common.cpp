@@ -2414,7 +2414,9 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    const size_t tgt = device_tgt ? llama_state_seq_device_to_host(device_tgt.get(), nullptr, 0, nullptr, 0) : data_tgt.size();
+    const size_t dft = device_dft ? llama_state_seq_device_to_host(device_dft.get(), nullptr, 0, nullptr, 0) : data_dft.size();
+    return tgt + dft + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2430,6 +2432,8 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+    device_tgt.reset();
+    device_dft.reset();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2449,11 +2453,14 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    if (device_tgt) { flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE; }
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = device_tgt
+        ? llama_state_seq_device_get(ctx, data_tgt.data(), ckpt_size, seq_id, flags, device_tgt.get())
+        : llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2467,11 +2474,14 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    if (device_dft) { flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE; }
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = device_dft
+        ? llama_state_seq_device_get(ctx, data_dft.data(), ckpt_size, seq_id, flags, device_dft.get())
+        : llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2489,7 +2499,9 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    const size_t n = device_tgt
+        ? llama_state_seq_device_set(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags, device_tgt.get())
+        : llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     return n == data_tgt.size();
 }
 
@@ -2505,15 +2517,35 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    const size_t n = device_dft
+        ? llama_state_seq_device_set(ctx, data_dft.data(), data_dft.size(), seq_id, flags, device_dft.get())
+        : llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     return n == data_dft.size();
+}
+
+static void common_checkpoint_to_host(common_state_data & data, std::shared_ptr<llama_state_seq_device> & device) {
+    if (!device) { return; }
+    const size_t size = llama_state_seq_device_to_host(device.get(), data.data(), data.size(), nullptr, 0);
+    common_state_data host(size);
+    if (llama_state_seq_device_to_host(device.get(), data.data(), data.size(), host.data(), host.size()) != size) {
+        GGML_ABORT("device checkpoint materialization failed\n");
+    }
+    data = std::move(host);
+    device.reset();
+}
+
+void common_prompt_checkpoint::to_host() {
+    common_checkpoint_to_host(data_tgt, device_tgt);
+    common_checkpoint_to_host(data_dft, device_dft);
 }
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    device_tgt.reset();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+    device_dft.reset();
 }

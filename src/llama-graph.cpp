@@ -4181,6 +4181,27 @@ void llm_graph_context::build_conv_state_store(
     const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
     const int64_t Kw = std::min(n, K);
 
+    // Decode-sized IKCS chain. Keep the same rollback slots and windows as
+    // SET_ROWS below, but expose the bounded snapshots directly to the CUDA
+    // fusion matcher. Slot k holds the window starting at n-k. Never change
+    // K, the cache capacity, or the long-prefill path.
+    static const bool cola_conv = [] {
+        const char * e = getenv("GGML_COLA");
+        return e && (atoi(e) & 4) != 0;
+    }();
+    if (cola_conv && n <= 8) {
+        for (int64_t k = 0; k < Kw; ++k) {
+            ggml_tensor * window = ggml_view_3d(ctx0, conv_x,
+                    n_cols, channels, n_seqs, conv_x->nb[1], conv_x->nb[2],
+                    ggml_row_size(conv_x->type, n - k));
+            ggml_tensor * cell = ggml_view_2d(ctx0, s,
+                    n_cols*channels, n_seqs, row_size,
+                    cell_offs + k*(size_t)mctx_cur->get_size()*row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, window, cell));
+        }
+        return;
+    }
+
     // each conv layer builds its own slot order {K-1, ..., 0}, on the device of the layer, and takes its tail
     // {Kw-1, ..., 0}; the size K never depends on the ubatch, so the reserved graph covers them all
     ggml_tensor * s_slot_rev = ggml_arange(ctx0, 0.0f, (float) K, 1.0f);

@@ -54,6 +54,8 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+// Opt-in stateless top-k prefix; RNG/accept remain on the CPU chain.
+struct llama_sampler * common_sampler_get_device_topk(struct common_sampler * gsmpl, int n_vocab);
 
 // extended sampling implementation:
 //

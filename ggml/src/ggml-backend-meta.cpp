@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -1899,6 +1900,267 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    typedef int      (*comm_ar_prepare_t)(void *, struct ggml_tensor **, void *, size_t);
+    typedef void     (*comm_ar_launch_rank_t)(void *, int, struct ggml_tensor *, const void *);
+    typedef void     (*graph_owner_fn_t)(ggml_backend_t);
+    typedef uint64_t (*graph_epoch_fn_t)(ggml_backend_t);
+    typedef bool     (*cuda_graph_is_compatible_t)(ggml_backend_t, struct ggml_cgraph *);
+    typedef bool     (*token_capture_begin_t)(ggml_backend_t);
+    typedef bool     (*token_capture_end_t)(ggml_backend_t, void **, void **);
+    typedef bool     (*token_graph_launch_t)(ggml_backend_t, void *);
+    typedef void     (*token_graph_free_t)(ggml_backend_t, void *, void *);
+
+    struct TokenGraphState {
+        static constexpr size_t CACHE_CAP = 16;
+
+        struct Entry {
+            uint64_t uid         = 0;
+            size_t   n_subgraphs = 0;
+            uint64_t signature   = 0;
+            uint64_t epochs[2]   = { 0, 0 };
+            int      seen        = 0;
+            bool     captured    = false;
+            bool     failed      = false;
+            uint64_t last_use    = 0;
+            uint64_t launches    = 0;
+            void *   graphs[2]   = { nullptr, nullptr };
+            void *   execs[2]    = { nullptr, nullptr };
+        };
+
+        bool     enabled              = false;
+        int      warm_needed          = 2;
+        int      min_subgraphs        = 8;
+        bool     owner_held           = false;
+        uint64_t use_seq              = 0;
+        uint64_t total_captures       = 0;
+        uint64_t total_launches       = 0;
+        uint64_t total_evicts         = 0;
+        uint64_t total_sig_invals     = 0;
+        uint64_t total_epoch_invals   = 0;
+        uint64_t total_cap_fails      = 0;
+        uint64_t total_skipped_small  = 0;
+        uint64_t total_owner_releases = 0;
+        Entry    entries[CACHE_CAP];
+
+        comm_ar_prepare_t          ar_prepare     = nullptr;
+        comm_ar_launch_rank_t      ar_launch_rank = nullptr;
+        graph_owner_fn_t           owner_acquire  = nullptr;
+        graph_owner_fn_t           owner_release  = nullptr;
+        graph_epoch_fn_t           graph_epoch    = nullptr;
+        cuda_graph_is_compatible_t is_compatible  = nullptr;
+        token_capture_begin_t      capture_begin  = nullptr;
+        token_capture_end_t        capture_end    = nullptr;
+        token_graph_launch_t       graph_launch   = nullptr;
+        token_graph_free_t         graph_free     = nullptr;
+
+        static uint64_t fnv1a_bytes(uint64_t h, const void * data, size_t len) {
+            const uint8_t * p = (const uint8_t *) data;
+            for (size_t i = 0; i < len; ++i) {
+                h ^= p[i];
+                h *= 1099511628211ULL;
+            }
+            return h;
+        }
+
+        template <typename T>
+        static uint64_t fnv1a_val(uint64_t h, const T & v) {
+            return fnv1a_bytes(h, &v, sizeof(T));
+        }
+
+        static uint64_t compute_signature(const std::vector<backend_config> & bcs, size_t n_subgraphs) {
+            uint64_t h = 14695981039346656037ULL;
+            h = fnv1a_val(h, n_subgraphs);
+            for (size_t j = 0; j < 2 && j < bcs.size(); ++j) {
+                const auto & bcj = bcs[j];
+                for (size_t i = 0; i < n_subgraphs; ++i) {
+                    const ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
+                    h = fnv1a_val(h, cg->n_nodes);
+                    h = fnv1a_val(h, cg->n_leafs);
+                    for (int k = 0; k < cg->n_nodes; ++k) {
+                        const ggml_tensor * t = cg->nodes[k];
+                        const uint32_t op_u   = (uint32_t) t->op;
+                        const uint32_t type_u = (uint32_t) t->type;
+                        const int32_t  flg    = t->flags;
+                        const uintptr_t dptr  = (uintptr_t) t->data;
+                        h = fnv1a_val(h, op_u);
+                        h = fnv1a_val(h, type_u);
+                        h = fnv1a_val(h, flg);
+                        h = fnv1a_val(h, dptr);
+                        h = fnv1a_bytes(h, t->ne, sizeof(t->ne));
+                        h = fnv1a_bytes(h, t->nb, sizeof(t->nb));
+                        h = fnv1a_bytes(h, t->op_params, sizeof(t->op_params));
+                        h = fnv1a_val(h, t->view_offs);
+                        const uintptr_t vsrc = (uintptr_t) (t->view_src ? t->view_src->data : nullptr);
+                        h = fnv1a_val(h, vsrc);
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            const ggml_tensor * src = t->src[s];
+                            const uintptr_t sptr = (uintptr_t) (src ? src->data : nullptr);
+                            h = fnv1a_val(h, sptr);
+                            if (src) {
+                                const uint32_t st = (uint32_t) src->type;
+                                h = fnv1a_val(h, st);
+                                h = fnv1a_bytes(h, src->ne, sizeof(src->ne));
+                                h = fnv1a_bytes(h, src->nb, sizeof(src->nb));
+                            }
+                        }
+                    }
+                }
+            }
+            return h;
+        }
+
+        void set_inner_owner(std::vector<backend_config> & bcs, bool hold) {
+            if (owner_held == hold || !owner_acquire || !owner_release) {
+                return;
+            }
+            for (auto & bc : bcs) {
+                if (hold) {
+                    owner_acquire(bc.backend);
+                } else {
+                    owner_release(bc.backend);
+                }
+            }
+            if (!hold) {
+                total_owner_releases++;
+            }
+            owner_held = hold;
+        }
+
+        void free_entry(std::vector<backend_config> & bcs, Entry & e) {
+            if (graph_free) {
+                for (size_t j = 0; j < 2 && j < bcs.size(); ++j) {
+                    if (e.graphs[j] != nullptr || e.execs[j] != nullptr) {
+                        graph_free(bcs[j].backend, e.graphs[j], e.execs[j]);
+                        e.graphs[j] = nullptr;
+                        e.execs[j]  = nullptr;
+                    }
+                }
+            }
+            e = Entry{};
+        }
+
+        Entry & acquire_entry(
+                std::vector<backend_config> & bcs,
+                uint64_t                      uid,
+                size_t                        n_subgraphs,
+                uint64_t                      sig,
+                const uint64_t                cur_epochs[2]) {
+            use_seq++;
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                if (entries[i].uid == uid) {
+                    Entry & e = entries[i];
+                    const bool epoch_changed =
+                        e.epochs[0] != cur_epochs[0] || e.epochs[1] != cur_epochs[1];
+                    const bool sig_changed =
+                        e.n_subgraphs != n_subgraphs || e.signature != sig;
+                    if (epoch_changed) {
+                        if (e.captured || e.seen > 0) {
+                            total_epoch_invals++;
+                        }
+                        free_entry(bcs, e);
+                        e.uid         = uid;
+                        e.n_subgraphs = n_subgraphs;
+                        e.signature   = sig;
+                        e.epochs[0]   = cur_epochs[0];
+                        e.epochs[1]   = cur_epochs[1];
+                    } else if (sig_changed) {
+                        if (e.captured || e.failed || e.seen > 0) {
+                            total_sig_invals++;
+                        }
+                        free_entry(bcs, e);
+                        e.uid         = uid;
+                        e.n_subgraphs = n_subgraphs;
+                        e.signature   = sig;
+                        e.epochs[0]   = cur_epochs[0];
+                        e.epochs[1]   = cur_epochs[1];
+                    }
+                    e.last_use = use_seq;
+                    return e;
+                }
+            }
+
+            size_t victim = CACHE_CAP;
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                if (entries[i].uid == 0) {
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim == CACHE_CAP) {
+                for (size_t i = 0; i < CACHE_CAP; ++i) {
+                    if (!entries[i].captured) {
+                        if (victim == CACHE_CAP || entries[i].last_use < entries[victim].last_use) {
+                            victim = i;
+                        }
+                    }
+                }
+            }
+            if (victim == CACHE_CAP) {
+                victim = 0;
+                for (size_t i = 1; i < CACHE_CAP; ++i) {
+                    if (entries[i].last_use < entries[victim].last_use) {
+                        victim = i;
+                    }
+                }
+            }
+            if (entries[victim].uid != 0) {
+                if (entries[victim].captured) {
+                    total_evicts++;
+                }
+                free_entry(bcs, entries[victim]);
+            }
+            entries[victim].uid         = uid;
+            entries[victim].n_subgraphs = n_subgraphs;
+            entries[victim].signature   = sig;
+            entries[victim].epochs[0]   = cur_epochs[0];
+            entries[victim].epochs[1]   = cur_epochs[1];
+            entries[victim].last_use    = use_seq;
+            return entries[victim];
+        }
+
+        void reset(std::vector<backend_config> & bcs) {
+            set_inner_owner(bcs, false);
+            if (enabled && (total_captures > 0 || total_launches > 0)) {
+                GGML_LOG_INFO(
+                    "meta backend whole-token HIP graph stats: captures=%llu launches=%llu evicts=%llu "
+                    "sig_inval=%llu epoch_inval=%llu cap_fail=%llu skip_small=%llu owner_rel=%llu\n",
+                    (unsigned long long) total_captures,
+                    (unsigned long long) total_launches,
+                    (unsigned long long) total_evicts,
+                    (unsigned long long) total_sig_invals,
+                    (unsigned long long) total_epoch_invals,
+                    (unsigned long long) total_cap_fails,
+                    (unsigned long long) total_skipped_small,
+                    (unsigned long long) total_owner_releases);
+            }
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                free_entry(bcs, entries[i]);
+            }
+        }
+    } tg;
+
+    static bool env_enabled(const char * name) {
+        const char * v = std::getenv(name);
+        return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }
+
+    static bool env_flag_or(const char * name, bool def) {
+        const char * v = std::getenv(name);
+        if (!v || v[0] == '\0') { return def; }
+        return std::strcmp(v, "0") != 0;
+    }
+
+    static int env_int(const char * name, int def, int lo, int hi) {
+        const char * v = std::getenv(name);
+        if (!v || v[0] == '\0') { return def; }
+        char * end = nullptr;
+        long val = std::strtol(v, &end, 10);
+        if (end == v) { return def; }
+        if (val < lo) { return lo; }
+        if (val > hi) { return hi; }
+        return (int) val;
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1925,14 +2187,39 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t reg0 = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            const bool want_tg_umbrella = env_enabled("GGML_HIP_AR_TG");
+            const bool want_token_graph = env_flag_or("GGML_META_TOKEN_GRAPH", want_tg_umbrella);
+            if (want_token_graph && simple_backends.size() == 2) {
+                tg.warm_needed    = env_int("GGML_META_TG_WARM", 2, 2, 16);
+                tg.min_subgraphs  = env_int("GGML_META_TG_MIN_SUBGRAPHS", 8, 2, 1024);
+                tg.ar_prepare     = (comm_ar_prepare_t)          ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_prepare");
+                tg.ar_launch_rank = (comm_ar_launch_rank_t)      ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_launch_rank");
+                tg.owner_acquire  = (graph_owner_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_owner_acquire");
+                tg.owner_release  = (graph_owner_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_owner_release");
+                tg.graph_epoch    = (graph_epoch_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_epoch");
+                tg.is_compatible  = (cuda_graph_is_compatible_t) ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_is_compatible");
+                tg.capture_begin  = (token_capture_begin_t)      ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_capture_begin");
+                tg.capture_end    = (token_capture_end_t)        ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_capture_end");
+                tg.graph_launch   = (token_graph_launch_t)       ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_graph_launch");
+                tg.graph_free     = (token_graph_free_t)         ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_graph_free");
+                if (tg.ar_prepare && tg.ar_launch_rank && tg.owner_acquire && tg.owner_release &&
+                    tg.graph_epoch && tg.is_compatible && tg.capture_begin && tg.capture_end &&
+                    tg.graph_launch && tg.graph_free) {
+                    tg.enabled = true;
+                    GGML_LOG_INFO("meta backend whole-token HIP graph enabled (warm_needed=%d, min_subgraphs=%d)\n",
+                        tg.warm_needed, tg.min_subgraphs);
+                }
+            }
         }
     }
 
     ~ggml_backend_meta_context() {
+        tg.reset(backend_configs);
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2065,6 +2352,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
+        if (backend_ctx->tg.enabled) {
+            backend_ctx->tg.reset(backend_ctx->backend_configs);
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             bcj.nodes.resize(cgraph->n_nodes);
@@ -2529,6 +2819,173 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    auto & tg = backend_ctx->tg;
+    tg.set_inner_owner(backend_ctx->backend_configs, false);
+    if (tg.enabled && backend_ctx->comm_ctx && n_backends == 2 && cgraph->uid != 0) {
+        if (backend_ctx->n_subgraphs < (size_t) tg.min_subgraphs) {
+            tg.total_skipped_small++;
+        } else {
+            const uint64_t cur_epochs[2] = {
+                tg.graph_epoch(backend_ctx->backend_configs[0].backend),
+                tg.graph_epoch(backend_ctx->backend_configs[1].backend),
+            };
+            const uint64_t sig = ggml_backend_meta_context::TokenGraphState::compute_signature(
+                backend_ctx->backend_configs, backend_ctx->n_subgraphs);
+            auto & entry = tg.acquire_entry(
+                backend_ctx->backend_configs, cgraph->uid, backend_ctx->n_subgraphs, sig, cur_epochs);
+
+            if (entry.captured) {
+                bool launch_ok = true;
+                for (size_t j = 0; j < 2; ++j) {
+                    if (!tg.graph_launch(backend_ctx->backend_configs[j].backend, entry.execs[j])) {
+                        launch_ok = false;
+                        break;
+                    }
+                }
+                if (launch_ok) {
+                    entry.launches++;
+                    tg.total_launches++;
+                    return GGML_STATUS_SUCCESS;
+                }
+                tg.free_entry(backend_ctx->backend_configs, entry);
+                entry.uid         = cgraph->uid;
+                entry.n_subgraphs = backend_ctx->n_subgraphs;
+                entry.signature   = sig;
+                entry.epochs[0]   = cur_epochs[0];
+                entry.epochs[1]   = cur_epochs[1];
+                entry.last_use    = tg.use_seq;
+                entry.failed      = true;
+                tg.total_cap_fails++;
+            } else if (!entry.failed) {
+                struct alignas(16) ar_plan_buf {
+                    unsigned char raw[64];
+                };
+                std::vector<ar_plan_buf> plans(backend_ctx->n_subgraphs - 1);
+                bool eligible = true;
+                for (size_t i = 0; i < backend_ctx->n_subgraphs && eligible; ++i) {
+                    for (size_t j = 0; j < 2; ++j) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        if (!tg.is_compatible(bcj.backend, bcj.cgraphs[i].cgraph_main)) {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                    if (eligible && i < backend_ctx->n_subgraphs - 1) {
+                        ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                        ggml_cgraph * cg1 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                        ggml_tensor * nodes[2] = {
+                            cg0->nodes[cg0->n_nodes - 1],
+                            cg1->nodes[cg1->n_nodes - 1]
+                        };
+                        if (tg.ar_prepare(backend_ctx->comm_ctx, nodes, plans[i].raw, sizeof(plans[i].raw)) != 1) {
+                            eligible = false;
+                        }
+                    }
+                }
+
+                if (!eligible) {
+                    entry.failed = true;
+                } else {
+                    entry.seen++;
+                    if (entry.seen >= tg.warm_needed) {
+                        tg.set_inner_owner(backend_ctx->backend_configs, true);
+                        bool began[2] = { false, false };
+                        bool cap_ok = true;
+                        for (size_t j = 0; j < 2; ++j) {
+                            if (!tg.capture_begin(backend_ctx->backend_configs[j].backend)) {
+                                cap_ok = false;
+                                break;
+                            }
+                            began[j] = true;
+                        }
+                        if (!cap_ok) {
+                            for (size_t j = 0; j < 2; ++j) {
+                                if (began[j]) {
+                                    void * dg = nullptr;
+                                    void * de = nullptr;
+                                    tg.capture_end(backend_ctx->backend_configs[j].backend, &dg, &de);
+                                    tg.graph_free(backend_ctx->backend_configs[j].backend, dg, de);
+                                }
+                            }
+                            tg.set_inner_owner(backend_ctx->backend_configs, false);
+                            entry.failed = true;
+                            tg.total_cap_fails++;
+                        } else {
+                            ggml_status cap_status = GGML_STATUS_SUCCESS;
+                            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                                for (size_t j = 0; j < 2; ++j) {
+                                    auto & bcj = backend_ctx->backend_configs[j];
+                                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                                    if (status != GGML_STATUS_SUCCESS) {
+                                        cap_status = status;
+                                        break;
+                                    }
+                                }
+                                if (cap_status != GGML_STATUS_SUCCESS) {
+                                    break;
+                                }
+                                if (i < backend_ctx->n_subgraphs - 1) {
+                                    ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                                    ggml_cgraph * cg1 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                                    tg.ar_launch_rank(backend_ctx->comm_ctx, 0, cg0->nodes[cg0->n_nodes - 1], plans[i].raw);
+                                    tg.ar_launch_rank(backend_ctx->comm_ctx, 1, cg1->nodes[cg1->n_nodes - 1], plans[i].raw);
+                                }
+                            }
+                            bool end_ok = (cap_status == GGML_STATUS_SUCCESS);
+                            void * new_g[2] = { nullptr, nullptr };
+                            void * new_e[2] = { nullptr, nullptr };
+                            for (size_t j = 0; j < 2; ++j) {
+                                if (!tg.capture_end(backend_ctx->backend_configs[j].backend, &new_g[j], &new_e[j])) {
+                                    end_ok = false;
+                                }
+                            }
+                            tg.set_inner_owner(backend_ctx->backend_configs, false);
+
+                            if (end_ok && new_e[0] != nullptr && new_e[1] != nullptr) {
+                                entry.graphs[0] = new_g[0]; entry.graphs[1] = new_g[1];
+                                entry.execs[0]  = new_e[0]; entry.execs[1]  = new_e[1];
+                                entry.captured  = true;
+                                tg.total_captures++;
+                                ggml_cgraph * cg0_first = backend_ctx->backend_configs[0].cgraphs[0].cgraph_main;
+                                int64_t ne0 = (cg0_first->n_nodes > 0) ? ggml_nelements(cg0_first->nodes[cg0_first->n_nodes - 1]) : 0;
+                                GGML_LOG_INFO("meta backend whole-token HIP graph captured (n_subgraphs=%zu, ar=%zu, uid=%llu, ne0=%lld, cap=%llu)\n",
+                                    backend_ctx->n_subgraphs, backend_ctx->n_subgraphs - 1,
+                                    (unsigned long long) cgraph->uid, (long long) ne0, (unsigned long long) tg.total_captures);
+                                bool first_launch_ok = true;
+                                for (size_t j = 0; j < 2; ++j) {
+                                    if (!tg.graph_launch(backend_ctx->backend_configs[j].backend, entry.execs[j])) {
+                                        first_launch_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (first_launch_ok) {
+                                    entry.launches++;
+                                    tg.total_launches++;
+                                    return GGML_STATUS_SUCCESS;
+                                }
+                            } else {
+                                for (size_t j = 0; j < 2; ++j) {
+                                    tg.graph_free(backend_ctx->backend_configs[j].backend, new_g[j], new_e[j]);
+                                }
+                            }
+                            GGML_LOG_WARN("meta backend whole-token HIP graph capture/launch failed (uid=%llu, subgraphs=%zu), falling back to per-subgraph\n",
+                                (unsigned long long) cgraph->uid, backend_ctx->n_subgraphs);
+                            tg.free_entry(backend_ctx->backend_configs, entry);
+                            entry.uid         = cgraph->uid;
+                            entry.n_subgraphs = backend_ctx->n_subgraphs;
+                            entry.signature   = sig;
+                            entry.epochs[0]   = cur_epochs[0];
+                            entry.epochs[1]   = cur_epochs[1];
+                            entry.last_use    = tg.use_seq;
+                            entry.failed      = true;
+                            tg.total_cap_fails++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2606,4 +3063,24 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+size_t ggml_backend_meta_tg_get_stats(ggml_backend_t meta_backend, uint64_t * out, size_t cap) {
+    if (!ggml_backend_is_meta(meta_backend) || out == nullptr) {
+        return 0;
+    }
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    const uint64_t vals[8] = {
+        backend_ctx->tg.total_captures,
+        backend_ctx->tg.total_launches,
+        backend_ctx->tg.total_evicts,
+        backend_ctx->tg.total_sig_invals,
+        backend_ctx->tg.total_epoch_invals,
+        backend_ctx->tg.total_cap_fails,
+        backend_ctx->tg.total_skipped_small,
+        backend_ctx->tg.total_owner_releases,
+    };
+    const size_t n = std::min<size_t>(cap, 8);
+    std::memcpy(out, vals, n * sizeof(uint64_t));
+    return n;
 }

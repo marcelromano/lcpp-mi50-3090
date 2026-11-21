@@ -1363,6 +1363,16 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+#ifdef GGML_EXP_COLA
+    void * cola_scratch = nullptr;
+    void * ikcs_scratch = nullptr;
+    size_t ikcs_capacity = 0;
+#endif
+
+    // Whole-token outer graph ownership refcount, pool invalidation epoch, and failure injection hook.
+    uint32_t outer_graph_depth      = 0;
+    uint64_t graph_epoch            = 0;
+    bool     test_fail_next_capture = false;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

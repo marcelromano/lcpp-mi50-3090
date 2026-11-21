@@ -5,6 +5,17 @@
 
 #include <cstdint>
 
+// (A8): counters for the sibling MUL_MAT grouping (GGML_CUDA_MMQ_COUNT=1).
+static thread_local uint64_t mmq_calls = 0, mmq_quant_launches = 0, mmq_reuses = 0;
+void ggml_cuda_mmq_count(bool reset, bool graph_capture) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_MMQ_COUNT"); return e && atoi(e) != 0; }();
+    if (reset) { mmq_calls = mmq_quant_launches = mmq_reuses = 0; }
+    else if (enabled && mmq_calls) {
+        fprintf(stderr, "[mmq-share] calls=%llu quantize=%llu reused=%llu graph_capture=%d\n",
+            (unsigned long long) mmq_calls, (unsigned long long) mmq_quant_launches, (unsigned long long) mmq_reuses, (int) graph_capture);
+    }
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -161,9 +172,10 @@ static int ggml_cuda_mmq_get_J_best(
     return J_best;
 }
 
-void ggml_cuda_mul_mat_q(
+// shared_q8_1/reuse_q8_1: A8, caller already quantized src1 for this group of sibling MUL_MATs.
+static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, char * shared_q8_1 = nullptr, bool reuse_q8_1 = false) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -270,13 +282,17 @@ void ggml_cuda_mul_mat_q(
         const int ntj = (ne1 + J_best - 1) / J_best;
 
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        if (!shared_q8_1) { src1_q8_1.alloc(nbytes_src1_q8_1); }
+        char * y_q8_1 = shared_q8_1 ? shared_q8_1 : src1_q8_1.get();
+        ++mmq_calls;
+        if (reuse_q8_1) { ++mmq_reuses; } else { ++mmq_quant_launches; }
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (!reuse_q8_1) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -284,11 +300,11 @@ void ggml_cuda_mul_mat_q(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, y_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, y_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -301,7 +317,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) y_q8_1, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -390,6 +406,49 @@ void ggml_cuda_mul_mat_q(
         ntj, J_best, fusion_device};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, fusion);
+}
+
+// (A8): q8_1 bytes needed by one member of a sibling group (dense path, same src1).
+static size_t ggml_cuda_mmq_q8_1_nbytes(const ggml_tensor * src0, const ggml_tensor * src1, const int cc, const size_t smpbo,
+        const ggml_prec prec_src1) {
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const bool   fallback     = ggml_cuda_mmq_needs_fallback(src0->ne[1]);
+    const bool   use_native_fp4 = prec_src1 == GGML_PREC_Q4;
+    const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ          : QK8_1_MMQ;
+    int nthreads_best = 0;
+    const int J_best = ggml_cuda_mmq_get_J_best(src0->type, src1->ne[1], fallback, cc, smpbo, prec_src1, &nthreads_best);
+    GGML_ASSERT(J_best > 0 && nthreads_best > 0);
+    const size_t chunk = nthreads_best * sizeof(int);
+    const size_t pad   = ((J_best * sizeof(block_q8_1_mmq) + chunk - 1) / chunk) * chunk;
+    return src1->ne[3]*src1->ne[2]*src1->ne[1]*ne10_padded * y_block_size/y_values_per_block + pad;
+}
+
+// (A8): the caller only groups adjacent read-only dense GEMMs with the same src1 and
+// q8_1 layout, so the activation quantization is launched once and the pool allocation spans the whole group.
+void ggml_cuda_mul_mat_q_shared_src1(ggml_backend_cuda_context & ctx, ggml_tensor ** group, int n) {
+    const ggml_tensor * src1 = group[0]->src[1];
+    const int    id    = ctx.device;
+    const int    cc    = ggml_cuda_info().devices[id].cc;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    size_t reserve = 0;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * w = group[i]->src[0];
+        GGML_ASSERT(group[i]->src[1] == src1);
+        GGML_ASSERT(mmq_get_q8_1_ds_layout(w->type) == mmq_get_q8_1_ds_layout(group[0]->src[0]->type));
+        const ggml_prec prec = ggml_cuda_mmq_get_prec_src1(w->type, ggml_prec_get_src(group[i], 1), cc);
+        reserve = std::max(reserve, ggml_cuda_mmq_q8_1_nbytes(w, src1, cc, smpbo, prec));
+    }
+    ggml_cuda_pool_alloc<char> q8(ctx.pool(), reserve);
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_mul_mat_q_impl(ctx, group[i]->src[0], src1, nullptr, group[i], nullptr, q8.get(), i != 0);
+    }
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

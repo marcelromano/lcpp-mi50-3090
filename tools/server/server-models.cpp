@@ -2662,6 +2662,10 @@ server_http_proxy::server_http_proxy(
     // shared between reader and writer threads
     auto cli  = std::make_shared<httplib::ClientImpl>(host, port);
     auto pipe = std::make_shared<server_pipe<msg_t>>();
+    // set by the upstream thread once the request to the child concluded by itself;
+    // cleanup() uses it to tell a normal end from a downstream that went away while the
+    // child is still working (client disconnect, DELETE /v1/stream, window closed)
+    auto upstream_done = std::make_shared<std::atomic<bool>>(false);
 
     if (scheme == "https") {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -2796,8 +2800,9 @@ server_http_proxy::server_http_proxy(
 
     // start the proxy thread
     SRV_DBG("start proxy thread %s %s\n", req.method.c_str(), req.path.c_str());
-    this->thread = std::thread([cli, pipe, req, headers_sent, make_header_msg]() {
+    this->thread = std::thread([cli, pipe, req, headers_sent, make_header_msg, upstream_done]() {
         auto result = cli->send(std::move(req));
+        upstream_done->store(true, std::memory_order_release);
         if (result.error() != httplib::Error::Success) {
             auto err_str = httplib::to_string(result.error());
             SRV_ERR("http client error: %s\n", err_str.c_str());

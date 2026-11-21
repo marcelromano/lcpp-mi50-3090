@@ -1248,6 +1248,40 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+bool llama_kv_cache::get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const {
+    out = {};
+    if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size() || seq_id >= LLAMA_MAX_SEQ ||
+            swa_type != LLAMA_SWA_TYPE_NONE || !sc_info.ssrc.empty()) {
+        return false;
+    }
+    const auto stream = seq_to_stream[seq_id];
+    if (stream >= v_cells.size() || !v_cells[stream].get_seq_capacity(seq_id, out)) {
+        return false;
+    }
+    out.stream_id = stream;
+    out.stream_count = n_stream;
+    return true;
+}
+
+bool llama_kv_cache::get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const {
+    out = {};
+    if (get_has_shift()) {
+        return false;
+    }
+    llama_memory_seq_capacity attn = {};
+    if (!get_seq_capacity(seq_id, attn)) {
+        return false;
+    }
+    out.attention_known = true;
+    out.attention_stream_id = attn.stream_id;
+    out.attention_stream_count = attn.stream_count;
+    out.attention_capacity_cells = attn.capacity_cells;
+    out.attention_used_cells = attn.used_cells;
+    out.attention_seq_cells = attn.seq_cells;
+    out.attention_seq_exclusive_cells = attn.seq_exclusive_cells;
+    return true;
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
@@ -2347,6 +2381,8 @@ const slot_info_vec_t *   sinfos_in) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
+        const uint32_t destination_stream = seq_id == -1 ? s : seq_to_stream[seq_id];
+        io.restore_cells(0, destination_stream, cell_count);
 
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
@@ -2370,7 +2406,10 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         if (!res) {
-            state_clear(seq_id, strm, sinfo);
+            if (io.restore_should_cleanup()) {
+                io.restore_clear();
+                state_clear(seq_id, strm, sinfo);
+            }
             throw std::runtime_error("failed to restore kv cache");
         }
 
@@ -2518,17 +2557,23 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
+    // Reject impossible metadata before mutation or allocating a batch from an
+    // untrusted snapshot header. This is a physical buffer bound, not an
+    // admission reservation for future growth of other sequences.
+    if (cell_count > cells.size()) {
+        LLAMA_LOG_ERROR("%s: snapshot cell count exceeds kv stream capacity\n", __func__);
+        return false;
+    }
+
     if (dest_seq_id != -1) {
         // single sequence
-        if (cell_count > cells.size()) {
-            LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
-            return false;
+        if(!io.validation_only() && !io.destination_precleared()) {
+            io.restore_clear(); seq_rm(dest_seq_id, -1, -1);
         }
-
-        seq_rm(dest_seq_id, -1, -1);
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
+        io.restore_allocate();
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 
         ubatch.seq_id_unq[0] = dest_seq_id;
@@ -2577,6 +2622,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.seq_id[i]   = &dest_seq_id;
         }
 
+        if (io.validation_only()) {
+            sinfo.s0 = strm; sinfo.s1 = strm; sinfo.resize(1); sinfo.strm[0] = strm;
+            sinfo.idxs[0].resize(cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) sinfo.idxs[0][i] = i;
+            return true;
+        }
         if (sinfo_in) {
             // this cache mirrors another one, so it takes that cache's layout instead of searching for its own cells
             if (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count) {
@@ -2608,6 +2659,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;
             }
+
         }
 
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
@@ -2692,6 +2744,48 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     return true;
 }
 
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+// t46: restore into a fragmented (unified, np>1) cache scattered one row per io.read_tensor() call: one file read plus one
+// synchronous ggml_backend_tensor_set (two in -sm tensor) per cell, per layer, for K and V. Consecutive destination cells
+// are consecutive in the file, so a run of cells is read with a single call. Bit-exact; GGML_KV_RESTORE_RUNS=0 restores
+// the per-cell loop for A/B with the same binary.
+static bool kv_restore_runs_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_KV_RESTORE_RUNS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+static uint32_t kv_restore_count_runs(const std::vector<uint32_t> & idxs, uint32_t n) {
+    uint32_t runs = n ? 1 : 0;
+    for (uint32_t i = 1; i < n; ++i) {
+        runs += idxs[i] != idxs[i - 1] + 1;
+    }
+    return runs;
+}
+#endif
+
+static void kv_restore_scatter(llama_io_read_i & io, ggml_tensor * t, const std::vector<uint32_t> & idxs, uint32_t n, size_t row) {
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+    if (kv_restore_runs_enabled()) {
+        uint32_t i = 0;
+        while (i < n) {
+            uint32_t j = i + 1;
+            while (j < n && idxs[j] == idxs[j - 1] + 1) {
+                ++j;
+            }
+            io.read_tensor(t, (size_t) idxs[i] * row, (size_t) (j - i) * row);
+            i = j;
+        }
+        return;
+    }
+#endif
+    for (uint32_t i = 0; i < n; ++i) {
+        io.read_tensor(t, (size_t) idxs[i] * row, row);
+    }
+}
+
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
 
@@ -2717,6 +2811,13 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     uint32_t n_layer;
     uint32_t n_rot_k_ref;
     uint32_t n_rot_v_ref;
+
+#ifdef GGML_EXP_KV_RESTORE_RUNS
+    if (cell_count && !sinfo.idxs.empty()) {
+        fprintf(stderr, "%s: kv restore: stream %u, %u cells, %u runs, contiguous=%d, runs_enabled=%d\n", __func__, strm, cell_count,
+                kv_restore_count_runs(sinfo.idxs[0], cell_count), (int) sinfo.is_contiguous(), (int) kv_restore_runs_enabled());
+    }
+#endif
 
     io.read(&v_trans, sizeof(v_trans));
     io.read(&n_layer, sizeof(n_layer));

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -1183,7 +1184,16 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// Retain a split UID only for a byte-identical allocated graph. Shape alone
+// is NOT sufficient: scratch addresses and op parameters are part of identity.
+struct ggml_backend_sched_identity {
+    std::vector<unsigned char> props;
+    size_t uid = 0;
+};
+using ggml_backend_sched_identity_cache = std::map<uint64_t, ggml_backend_sched_identity>;
+
 struct ggml_backend_sched {
+    ggml_backend_sched_identity_cache * identity_cache;
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
@@ -2394,6 +2404,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
+    delete sched->identity_cache;
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
@@ -2456,6 +2467,57 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
+    }
+
+    const char * pool_env = getenv("GGML_CUDA_GRAPH_POOL");
+    if (pool_env && *pool_env && strcmp(pool_env, "0") != 0) {
+        if (!sched->identity_cache) {
+            sched->identity_cache = new ggml_backend_sched_identity_cache;
+        }
+        auto & cache = *sched->identity_cache;
+        if (cache.size() > 32) {
+            cache.clear();
+        }
+        for (int s = 0; s < sched->n_splits; ++s) {
+            auto & split = sched->splits[s];
+            auto & gf = split.graph;
+            uint64_t signature = 1469598103934665603ULL;
+            auto mix = [&signature](uint64_t x) { signature = (signature ^ x)*1099511628211ULL; };
+            mix((uint64_t) split.backend_id);
+            mix((uint64_t) gf.n_nodes);
+            struct props_t {
+                ggml_tensor node;
+                void * src_data[GGML_MAX_SRC];
+                int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+                size_t src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+            };
+            std::vector<unsigned char> props((size_t) gf.n_nodes*sizeof(props_t));
+            for (int i = 0; i < gf.n_nodes; ++i) {
+                props_t prop = {};
+                const auto * node = gf.nodes[i];
+                memcpy(&prop.node, node, sizeof(ggml_tensor));
+                mix((uint64_t) node->op);
+                mix((uint64_t) node->type);
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    mix((uint64_t) node->ne[d]);
+                    mix((uint64_t) node->nb[d]);
+                }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j]) {
+                        prop.src_data[j] = node->src[j]->data;
+                        memcpy(prop.src_ne[j], node->src[j]->ne, sizeof(prop.src_ne[j]));
+                        memcpy(prop.src_nb[j], node->src[j]->nb, sizeof(prop.src_nb[j]));
+                    }
+                }
+                memcpy(props.data() + (size_t) i*sizeof(prop), &prop, sizeof(prop));
+            }
+            auto & entry = cache[signature];
+            if (entry.uid == 0 || entry.props != props) {
+                entry.props = std::move(props);
+                entry.uid = ggml_graph_next_uid();
+            }
+            gf.uid = entry.uid;
+        }
     }
 
     sched->is_alloc = true;
