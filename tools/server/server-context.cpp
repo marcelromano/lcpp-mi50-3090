@@ -1,7 +1,15 @@
 #include "server-context.h"
+#include "decode-prio.h"
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
+#include <cstdlib>
+
+// CPU integration instrumentation is absent unless explicitly compiled in.
+static const char * kv_admission_cpu_test_env(const char * name) {
+    (void) name;
+    return nullptr;
+}
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -9,6 +17,10 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-realtime.h"
+#include "server-slot-operation.h"
+#include "kv_planner.hpp"
+#include "kv_resource_view.hpp"
+#include "kv_restore_map.hpp"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -16,6 +28,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -24,15 +37,186 @@
 #include "base64.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <limits>
+#include <optional>
 #include <cstddef>
 #include <cinttypes>
 #include <deque>
 #include <exception>
 #include <memory>
+#include <new>
 #include <filesystem>
 #include <random>
 #include <utility>
 #include <fstream>
+#include <cctype>
+#include <mutex>
+#include <random>
+#include <unordered_map>
+
+// side file <slot file>.ckpt: the slot's context checkpoints (hybrid/recurrent models lose them otherwise)
+// layout: magic u32 | version u32 | n_tokens_total u64 | tokens_hash u64 | n u32 |
+//         n x { n_tokens i64 | pos_min i32 | pos_max i32 | size_tgt u64 | size_dft u64 | size_spec u64 | tgt | dft | spec }
+static constexpr uint32_t SLOT_CKPT_MAGIC   = 0x504b434c; // "LCKP"
+static constexpr uint32_t SLOT_CKPT_VERSION = 1;
+
+static uint64_t slot_ckpt_hash_tokens(const llama_tokens & tokens) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const llama_token t : tokens) {
+        h ^= (uint64_t) (uint32_t) t;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+template <typename T>
+static void slot_ckpt_put(std::ofstream & f, const T & v) {
+    f.write(reinterpret_cast<const char *>(&v), sizeof(T));
+}
+
+template <typename T>
+static bool slot_ckpt_get(std::ifstream & f, T & v) {
+    f.read(reinterpret_cast<char *>(&v), sizeof(T));
+    return (bool) f;
+}
+
+// returns the number of checkpoints written (0 = side file removed/not written)
+static size_t slot_ckpt_save(const std::string & path, const llama_tokens & tokens, const std::list<common_prompt_checkpoint> & cks) {
+    std::error_code ec;
+    if (cks.empty()) {
+        std::filesystem::remove(path, ec); // do not leave a stale side file next to a fresh slot file
+        return 0;
+    }
+    const std::string tmp = path + ".tmp";
+    size_t expected_size = 0;
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return 0;
+        }
+        slot_ckpt_put<uint32_t>(f, SLOT_CKPT_MAGIC);
+        slot_ckpt_put<uint32_t>(f, SLOT_CKPT_VERSION);
+        slot_ckpt_put<uint64_t>(f, tokens.size());
+        slot_ckpt_put<uint64_t>(f, slot_ckpt_hash_tokens(tokens));
+        slot_ckpt_put<uint32_t>(f, (uint32_t) cks.size());
+        for (const auto & saved : cks) {
+            std::unique_ptr<common_prompt_checkpoint> host;
+            if (saved.device_tgt || saved.device_dft) {
+                host = std::make_unique<common_prompt_checkpoint>(saved);
+                host->to_host();
+            }
+            const auto & c = host ? *host : saved;
+            slot_ckpt_put<int64_t>(f, c.n_tokens);
+            slot_ckpt_put<int32_t>(f, c.pos_min);
+            slot_ckpt_put<int32_t>(f, c.pos_max);
+            slot_ckpt_put<uint64_t>(f, c.data_tgt.size());
+            slot_ckpt_put<uint64_t>(f, c.data_dft.size());
+            slot_ckpt_put<uint64_t>(f, c.data_spec.size());
+            f.write(reinterpret_cast<const char *>(c.data_tgt.data()),  c.data_tgt.size());
+            f.write(reinterpret_cast<const char *>(c.data_dft.data()),  c.data_dft.size());
+            f.write(reinterpret_cast<const char *>(c.data_spec.data()), c.data_spec.size());
+        }
+        const auto end = f.tellp();
+        if (end < 0) {
+            f.close();
+            std::filesystem::remove(tmp, ec);
+            return 0;
+        }
+        expected_size = (size_t) end;
+        f.flush();
+        if (!f) {
+            f.close();
+            std::filesystem::remove(tmp, ec);
+            return 0;
+        }
+        f.close();
+        if (f.fail()) {
+            std::filesystem::remove(tmp, ec);
+            return 0;
+        }
+    }
+    const auto tmp_size = std::filesystem::file_size(tmp, ec);
+    if (ec || tmp_size != expected_size) {
+        std::filesystem::remove(tmp, ec);
+        return 0;
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        return 0;
+    }
+    const auto final_size = std::filesystem::file_size(path, ec);
+    if (ec || final_size != expected_size) {
+        return 0;
+    }
+    return cks.size();
+}
+
+// loads into `out` only if the file is consistent with the restored tokens; returns the count loaded
+static size_t slot_ckpt_load(const std::string & path, const llama_tokens & tokens, size_t max_keep, std::list<common_prompt_checkpoint> & out, bool bounded) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        return 0;
+    }
+    std::ifstream f(path, std::ios::binary);
+    uint32_t magic = 0, version = 0, n = 0;
+    uint64_t n_total = 0, hash = 0;
+    if (!f || !slot_ckpt_get(f, magic) || !slot_ckpt_get(f, version) || !slot_ckpt_get(f, n_total) ||
+        !slot_ckpt_get(f, hash) || !slot_ckpt_get(f, n)) {
+        SRV_WRN("slot checkpoint file '%s' unreadable, ignoring\n", path.c_str());
+        return 0;
+    }
+    if (magic != SLOT_CKPT_MAGIC || version != SLOT_CKPT_VERSION) {
+        SRV_WRN("slot checkpoint file '%s' has unknown magic/version (%u), ignoring\n", path.c_str(), version);
+        return 0;
+    }
+    if (n_total != tokens.size() || hash != slot_ckpt_hash_tokens(tokens)) {
+        SRV_WRN("slot checkpoint file '%s' does not match the restored tokens (stale?), ignoring\n", path.c_str());
+        return 0;
+    }
+    std::vector<common_prompt_checkpoint> tmp;
+    for (uint32_t i = 0; i < n; i++) {
+        common_prompt_checkpoint c;
+        int64_t  nt = 0;
+        int32_t  p0 = 0, p1 = 0;
+        uint64_t s_tgt = 0, s_dft = 0, s_spec = 0;
+        if (!slot_ckpt_get(f, nt) || !slot_ckpt_get(f, p0) || !slot_ckpt_get(f, p1) ||
+            !slot_ckpt_get(f, s_tgt) || !slot_ckpt_get(f, s_dft) || !slot_ckpt_get(f, s_spec) ||
+            nt < 0 || (uint64_t) nt > n_total) {
+            SRV_WRN("slot checkpoint file '%s' is corrupt, ignoring\n", path.c_str());
+            return 0;
+        }
+        const uint64_t ckpt_cap = (uint64_t) nt * 1024ULL * 1024ULL + (1ULL << 20);
+        if (bounded && (s_tgt > ckpt_cap || s_dft > ckpt_cap || s_spec > (1ULL << 30))) {
+            SRV_WRN("slot checkpoint file '%s' is corrupt, ignoring\n", path.c_str());
+            return 0;
+        }
+        c.n_tokens = nt;
+        c.pos_min  = p0;
+        c.pos_max  = p1;
+        c.data_tgt.resize(s_tgt);
+        c.data_dft.resize(s_dft);
+        c.data_spec.resize(s_spec);
+        f.read(reinterpret_cast<char *>(c.data_tgt.data()),  s_tgt);
+        f.read(reinterpret_cast<char *>(c.data_dft.data()),  s_dft);
+        f.read(reinterpret_cast<char *>(c.data_spec.data()), s_spec);
+        if (!f) {
+            SRV_WRN("slot checkpoint file '%s' is truncated, ignoring\n", path.c_str());
+            return 0;
+        }
+        tmp.push_back(std::move(c));
+    }
+    while (tmp.size() > max_keep) {
+        tmp.erase(tmp.begin());
+    }
+    const size_t n_loaded = tmp.size();
+    for (auto & c : tmp) {
+        out.push_back(std::move(c));
+    }
+    return n_loaded;
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -44,6 +228,103 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static int server_spec_nmax_env(const char * name) {
+    const char * e = getenv(name);
+    if (!e || !*e) {
+        return 0;
+    }
+    return std::max(0, atoi(e));
+}
+
+// Sliding-window adaptive draft controller (1..4, per slot).
+struct mtp_adaptive_tracker {
+    static constexpr size_t WINDOW_SIZE = 8;
+    int draft_history[WINDOW_SIZE] = {0};
+    int accept_history[WINDOW_SIZE] = {0};
+    size_t head = 0;
+    size_t count = 0;
+
+    int init_n_max = 2;
+    int current_n_max = 2;
+    bool enabled = false;
+
+    void init(int default_n_max, bool is_enabled) {
+        init_n_max = default_n_max > 0 ? std::min(4, std::max(1, default_n_max)) : 2;
+        current_n_max = init_n_max;
+        enabled = is_enabled;
+        head = 0;
+        count = 0;
+        for (size_t i = 0; i < WINDOW_SIZE; ++i) {
+            draft_history[i] = 0;
+            accept_history[i] = 0;
+        }
+    }
+
+    void reset() {
+        head = 0;
+        count = 0;
+        current_n_max = init_n_max;
+        for (size_t i = 0; i < WINDOW_SIZE; ++i) {
+            draft_history[i] = 0;
+            accept_history[i] = 0;
+        }
+    }
+
+    void update(int n_draft, int n_accepted) {
+        if (!enabled || n_draft <= 0) {
+            return;
+        }
+        draft_history[head] = n_draft;
+        accept_history[head] = n_accepted;
+        head = (head + 1) % WINDOW_SIZE;
+        if (count < WINDOW_SIZE) {
+            count++;
+        }
+
+        int total_draft = 0;
+        int total_accept = 0;
+        for (size_t i = 0; i < count; ++i) {
+            total_draft += draft_history[i];
+            total_accept += accept_history[i];
+        }
+
+        if (total_draft < 2) {
+            return;
+        }
+
+        const double rate = (double) total_accept / (double) total_draft;
+
+        if (current_n_max == 1) {
+            if (rate >= 0.65) {
+                current_n_max = 2;
+            }
+        } else if (current_n_max == 2) {
+            if (rate < 0.58) {
+                current_n_max = 1;
+            } else if (rate >= 0.80) {
+                current_n_max = 3;
+            }
+        } else if (current_n_max == 3) {
+            if (rate < 0.74) {
+                current_n_max = 2;
+            } else if (rate >= 0.88) {
+                current_n_max = 4;
+            }
+        } else if (current_n_max == 4) {
+            if (rate < 0.82) {
+                current_n_max = 3;
+            }
+        }
+    }
+
+    int get_n_max(int max_cap) const {
+        if (!enabled) {
+            return max_cap;
+        }
+        return std::max(1, std::min(current_n_max, max_cap));
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -386,6 +667,56 @@ struct server_slot {
         prompt.clear();
     }
 
+    void clear_after_restore_failure() {
+        prompt_clear(); // also drops every old target/draft checkpoint
+        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1)) {
+            SLT_WRN(*this, "failed to clear draft sequence %d after restore failure\n", id);
+        }
+        common_speculative_clear_state(spec, id);
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        spec_is_replay = false;
+        json_schema = json::object();
+        smpl.reset();
+        n_keep = 0;
+        stats = {};
+        n_gen_last = 0;
+        i_batch = -1;
+        last_nl_pos = 0;
+        generated = {};
+        debug_generated_text.clear();
+        generated_tokens.clear();
+        generated_token_probs.clear();
+        inp_embd.clear();
+        n_sent_text = 0;
+        sampled = LLAMA_TOKEN_NULL;
+        has_next_token = true;
+        has_new_line = false;
+        truncated = false;
+        stop = STOP_TYPE_NONE;
+        stopping_word.clear();
+        stats.n_draft_tokens = stats.n_draft_accepted = stats.n_draft_verif_steps = 0;
+        n_accepted_per_pos.clear();
+        mtp_adapt.reset();
+        alora_invocation_start = -1;
+        mbatch.reset();
+        if (ctx_tgt) llama_set_sampler(ctx_tgt, id, nullptr);
+    }
+
+    void clear_optional_draft_restore() {
+        if (ctx_dft && !llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1)) {
+            SLT_WRN(*this, "failed to clear draft sequence %d after optional restore failure\n", id);
+        }
+        common_speculative_clear_state(spec, id);
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear_dft();
+        spec_is_replay = false;
+    }
+
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
 
@@ -414,6 +745,8 @@ struct server_slot {
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
+
+    mtp_adaptive_tracker mtp_adapt;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -450,6 +783,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        mtp_adapt.reset();
 
         n_predict_max = -1;
 
@@ -593,6 +927,10 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        if (mtp_adapt.enabled) {
+            n_draft_max = std::min(n_draft_max, mtp_adapt.get_n_max(4));
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -817,6 +1155,22 @@ struct server_slot {
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
+
+        // to_json runs in the serialized metrics task, never in the HTTP thread.
+        llama_memory_seq_capacity capacity = {};
+        const bool known = llama_memory_get_seq_capacity(llama_get_memory(ctx_tgt), id, &capacity);
+        res["kv_capacity"] = {{"known", known}, {"scope", "attention_kv_stream"}};
+        if (known) {
+            res["kv_capacity"] = {
+                {"known", true}, {"scope", "attention_kv_stream"},
+                {"unit", "cells"}, {"stream_id", capacity.stream_id},
+                {"stream_count", capacity.stream_count}, {"capacity_cells", capacity.capacity_cells},
+                {"used_cells", capacity.used_cells}, {"seq_cells", capacity.seq_cells},
+                {"seq_exclusive_cells", capacity.seq_exclusive_cells},
+            };
+        } else {
+            res["kv_capacity"]["reason"] = "unsupported_or_pending_memory_layout";
+        }
 
         const auto & ptask = task ? task : task_prev;
 
@@ -1046,6 +1400,60 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+    mutable slot_operation_registry slot_operations;
+    kvplan::Planner kv_admission_planner;
+    // CPU observability: atomic reads are safe from the HTTP props thread.
+    std::atomic<uint64_t> b3_limit{0}, b3_limit_rec{0}, b3_reserved{0}, b3_fenced{0}, b3_released{0}, b3_clears{0}, b3_refused{0};
+
+    uint64_t kv_admission_epoch = 0;
+    std::vector<std::optional<kvplan::Owner>> kv_admission_slot_owners;
+    bool kv_admission_release_failed = false;
+    bool kv_admission_layout_supported = false;
+    std::string kv_admission_layout_reason = "layout_not_checked";
+    uint64_t kv_admission_test_launch_count = 0;
+    uint64_t kv_admission_test_commit_count = 0;
+
+    bool kv_admission_simple_draft() const {
+        if (!ctx_dft || !spec) return false;
+        size_t active_types = 0;
+        for (const auto type : params_base.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_NONE) continue;
+            if (type != COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) return false;
+            ++active_types;
+        }
+        return active_types == 1;
+    }
+
+    // Bounded MTP support is based on the actual contexts. Qwen35 MTP reuses
+    // the target model object, but owns an attention-only context/memory; the
+    // target hybrid context owns both attention and recurrent state.
+    bool kv_admission_mtp_hybrid() const {
+        if (!ctx_tgt || !ctx_dft || !spec || !model_tgt || !llama_model_is_hybrid(model_tgt)) return false;
+        size_t active_types = 0;
+        for (const auto type : params_base.speculative.types) {
+            if (type == COMMON_SPECULATIVE_TYPE_NONE) continue;
+            if (type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) return false;
+            ++active_types;
+        }
+        if (active_types != 1 || llama_get_model(ctx_dft) != model_tgt ||
+                llama_get_ctx_other(ctx_dft) != nullptr ||
+                llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt) ||
+                llama_model_n_layer_nextn(model_tgt) <= 0 || llama_n_rs_seq(ctx_dft) != 0) return false;
+        for (const auto & slot : slots) {
+            llama_memory_resource_capacity target = {}, draft = {};
+            if (!llama_memory_get_resource_capacity(llama_get_memory(ctx_tgt), slot.id, &target, sizeof(target)) ||
+                    !llama_memory_get_resource_capacity(llama_get_memory(ctx_dft), slot.id, &draft, sizeof(draft)) ||
+                    !target.attention_known || !target.recurrent_known ||
+                    !draft.attention_known || draft.recurrent_known ||
+                    target.recurrent_rollback_groups != llama_n_rs_seq(ctx_tgt) + 1 ||
+                    !target.recurrent_rollback_groups) return false;
+        }
+        return true;
+    }
+
+    bool kv_admission_supported_draft() const {
+        return kv_admission_simple_draft() || kv_admission_mtp_hybrid();
+    }
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -1053,6 +1461,11 @@ public:
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
     server_context_impl() {
+        static std::atomic<uint64_t> next_epoch{1};
+        kv_admission_epoch = next_epoch.fetch_add(1, std::memory_order_relaxed);
+        if (kv_admission_epoch == 0) {
+            kv_admission_epoch = next_epoch.fetch_add(1, std::memory_order_relaxed);
+        }
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
@@ -1092,6 +1505,13 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    int spec_nmax_preset = 0;
+    int spec_nmax_solo   = 0;
+    int spec_nmax_multi  = 0;
+
+    bool spec_mtp_adapt_ours = false;
+    int  spec_mtp_adapt_up   = 0;
 
     common_speculative_ptr spec;
 
@@ -1211,9 +1631,47 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // LLAMA_SPEC_NMAX_SOLO=N raises effective draft n_max while a single
+        // slot is generating; multi-slot falls back to LLAMA_SPEC_NMAX_MULTI or preset.
+        // Set before server_output_limits() so ctx_tgt allocates enough output slots.
+        spec_nmax_preset = params_base.speculative.draft.n_max;
+        spec_nmax_solo   = server_spec_nmax_env("LLAMA_SPEC_NMAX_SOLO");
+        spec_nmax_multi  = server_spec_nmax_env("LLAMA_SPEC_NMAX_MULTI");
+        if (spec_nmax_solo > 0) {
+            params_base.speculative.draft.n_max = std::max(params_base.speculative.draft.n_max, spec_nmax_solo);
+            SRV_INF("spec nmax adaptive: solo=%d multi=%d preset=%d\n",
+                    spec_nmax_solo, spec_nmax_multi > 0 ? spec_nmax_multi : spec_nmax_preset,
+                    spec_nmax_preset);
+        }
+
+        spec_mtp_adapt_ours = server_spec_nmax_env("LLAMA_MTP_ADAPTIVE") > 0;
+        spec_mtp_adapt_up   = server_spec_nmax_env("LLAMA_MTP_ADAPTIVE_UP") > 0 ? 1 : 0;
+        if (spec_mtp_adapt_ours) {
+            params_base.speculative.draft.n_max = std::max(params_base.speculative.draft.n_max, (int32_t) 4);
+            SRV_INF("%s", "MTP adaptive (per-slot): window=8 depth=1..4\n");
+        }
+        if (spec_mtp_adapt_up) {
+            const int nmax_up = std::max(1, server_spec_nmax_env("LLAMA_MTP_ADAPTIVE_UP_NMAX") > 0
+                                            ? server_spec_nmax_env("LLAMA_MTP_ADAPTIVE_UP_NMAX") : 8);
+            params_base.speculative.draft.n_max = std::max(params_base.speculative.draft.n_max, nmax_up);
+            SRV_INF("MTP adaptive upstream (#27210): cap=%d floor=%d\n", nmax_up,
+                    server_spec_nmax_env("LLAMA_MTP_ADAPTIVE_UP_NMIN") > 0
+                        ? server_spec_nmax_env("LLAMA_MTP_ADAPTIVE_UP_NMIN") : 3);
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        SRV_INF("KV admission enabled=%d scope=%s\n", params_base.kv_admission,
+                common_kv_admission_scope_name(params_base.kv_admission_scope));
+        if (params_base.kv_admission) {
+            params_base.cache_ram_mib = 0;
+            params_base.cache_idle_slots = false;
+            params_base.n_ctx_checkpoints = 0;
+        }
+        slot_operations.configure_owner(params_base.slot_operation_owner);
+        slot_operations.configure_engine_id(params_base.slot_operation_engine_id);
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1481,6 +1939,14 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // short decode warm-up at server startup, once the can_seq_rm probes have cleared the
+        // memory (a clear drops the warmed graph/scheduler cache) and before the speculative samplers
+        // are registered. It pays the CUDA/HIP capture and instantiation of the decode/verify shapes
+        // here instead of inside the first request's predicted_ms. Dummy positions are removed right
+        // away: LLAMA_DECODE_WARMUP=N sets the single-token steps (default 8, 0 disables).
+        SRV_INF("%s", "t2052: decode warm-up (target)\n");
+        common_decode_warmup(ctx_tgt);
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
@@ -1489,6 +1955,10 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+
+        kv_admission_slot_owners.clear();
+        kv_admission_slot_owners.resize(slots.size());
+        kv_admission_release_failed = false;
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1504,6 +1974,12 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+
+            // same warm-up for the draft/MTP context. Its batches carry no outputs in the
+            // process() phase (bucketed by the MTP padding), which is also the shape that avoids the
+            // backend-sampling path while the sampler reservation is not in place yet.
+            SRV_INF("%s", "t2052: decode warm-up (draft)\n");
+            common_decode_warmup(ctx_dft, -1, /* all_no_output = */ true);
         }
 
         if (spec) {
@@ -1536,9 +2012,12 @@ private:
                 slot.tts.ctx.init(ctx_tgt, mctx);
             }
 
+            slot.mtp_adapt.init(spec_nmax_preset, spec_mtp_adapt_ours);
+
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                release_kv_admission_slot(id_slot);
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1550,6 +2029,28 @@ private:
             };
 
             slot.reset();
+        }
+
+        kv_admission_layout_supported = true;
+        kv_admission_layout_reason.clear();
+        const std::array<llama_context *, 2> admission_contexts = {ctx_tgt, ctx_dft};
+        for (size_t ci = 0; ci < admission_contexts.size() && kv_admission_layout_supported; ++ci) {
+            llama_context * admission_ctx = admission_contexts[ci];
+            if (!admission_ctx) continue;
+            const auto role = ci == 0 ? kvplan::Context::target : kvplan::Context::draft;
+            for (const auto & slot : slots) {
+                llama_memory_resource_capacity raw = {};
+                std::vector<kvplan::PhysicalView> physical;
+                const bool expect_recurrent = ci == 0 && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+                const bool expect_attention = !expect_recurrent || (ci == 0 && llama_model_is_hybrid(model_tgt));
+                if (!llama_memory_get_resource_capacity(llama_get_memory(admission_ctx), slot.id, &raw, sizeof(raw)) ||
+                        !kvplan::normalize_resources(role, kv_admission_epoch, raw, physical) ||
+                        !kvplan::layout_matches(physical, expect_attention, expect_recurrent)) {
+                    kv_admission_layout_supported = false;
+                    kv_admission_layout_reason = ci == 0 ? "unknown_or_invalid_target_memory_layout" : "unknown_or_invalid_draft_memory_layout";
+                    break;
+                }
+            }
         }
 
         {
@@ -1653,6 +2154,11 @@ private:
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
             return process_single_task(std::move(task), is_yielding);
+        });
+        queue_tasks.on_task_cancelled([this](const server_task & task) {
+            if (!task.slot_action.operation_id.empty()) {
+                slot_operations.cancel_before_start(task.slot_action.operation_id);
+            }
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
@@ -1882,7 +2388,7 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && prompt_cache && !params_base.kv_admission;
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
@@ -2076,9 +2582,23 @@ private:
             // TODO: check verify if this actually works with TTS
             use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
 
-            // TODO: tmp until backend sampling is fully implemented
+            // Under speculation, offload only a stateless top-k prefix when full
+            // backend sampling is disabled or rejected (e.g. penalties present).
+            // Never advance device RNG for rejected verify rows.
+            llama_sampler * device_topk = nullptr;
+            if (!use_backend_sampling && slot.can_speculate() && !need_pre_sample_logits) {
+                int32_t n_suppress = 0;
+                const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
+                llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+                if (n_suppress == 0) {
+                    device_topk = common_sampler_get_device_topk(slot.smpl.get(), llama_vocab_n_tokens(vocab));
+                }
+            }
             if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+            } else if (device_topk) {
+                llama_set_sampler(ctx_tgt, slot.id, device_topk);
+                SLT_INF(slot, "%s", "t1956 stateless device top-k enabled (CPU RNG preserved)\n");
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
@@ -2724,16 +3244,20 @@ private:
         return true;
     }
 
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
-        // only when the list is full, otherwise short prompts keep just the oldest checkpoint
+        // Prune redundant checkpoints of previous tasks even before the list is full
+        // (upstream 5d806aa257 gated this on a full list). Otherwise a one-token cached
+        // turn can materialize a large device snapshot merely to retain two old
+        // checkpoints less than min-step apart. Current-task checkpoints and the
+        // configured capacity are unchanged.
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
             if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
@@ -2781,8 +3305,51 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        // Opt-in, independent of -ctxcp: keep all eight production checkpoints. Only
+        // the bounded newest device snapshots use VRAM; spill older snapshots to host.
+        static const size_t device_limit = []() -> size_t {
+            const char * env = std::getenv("LLAMA_CTX_CHECKPOINTS_DEVICE");
+            if (!env) { return 0; }
+            char * end = nullptr;
+            const long value = std::strtol(env, &end, 10);
+            if (!*env || *end || value < 0 || value > 2) {
+                SRV_WRN("invalid LLAMA_CTX_CHECKPOINTS_DEVICE='%s', expected 0..2; disabled\n", env);
+                return 0;
+            }
+            return (size_t) value;
+        }();
+        const size_t limit = std::min(device_limit, (size_t) params_base.n_ctx_checkpoints);
+        if (limit && (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt))) {
+            auto acquire = [&]() {
+                cur.device_tgt.reset(llama_state_seq_device_acquire(ctx_tgt, slot.id, limit), llama_state_seq_device_free);
+                if (ctx_dft) {
+                    cur.device_dft.reset(llama_state_seq_device_acquire(ctx_dft, slot.id, limit), llama_state_seq_device_free);
+                }
+            };
+            acquire();
+            if (!cur.device_tgt || (ctx_dft && !cur.device_dft)) {
+                // Release partial acquisition before retry. Copies in the RAM cache also
+                // own leases: a bank is never overwritten while any checkpoint references it.
+                cur.device_tgt.reset();
+                cur.device_dft.reset();
+                for (auto & old : slot.prompt.checkpoints) {
+                    if (old.get() != &cur && (old->device_tgt || old->device_dft)) {
+                        auto host = std::make_shared<common_prompt_checkpoint>(*old);
+                        host->to_host();
+                        old = std::move(host);
+                        break;
+                    }
+                }
+                acquire();
+            }
+            if (!cur.device_tgt || (ctx_dft && !cur.device_dft)) {
+                cur.device_tgt.reset();
+                cur.device_dft.reset(); // exhausted pinned cache leases: safe host fallback
+            }
+        }
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        SLT_DBG(slot, "context checkpoint storage=%s device_limit=%zu\n", cur.device_tgt ? "device" : "host", limit);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2850,7 +3417,12 @@ private:
         ckpt_write(ofs, &version, sizeof(version), n_written);
         ckpt_write(ofs, &count,   sizeof(count),   n_written);
         for (const auto & ckpt : slot.prompt.checkpoints) {
-            const auto & cur = *ckpt;
+            std::unique_ptr<common_prompt_checkpoint> host;
+            if (ckpt->device_tgt || ckpt->device_dft) {
+                host = std::make_unique<common_prompt_checkpoint>(*ckpt);
+                host->to_host();
+            }
+            const auto & cur = host ? *host : *ckpt;
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
@@ -3009,6 +3581,548 @@ private:
         return n_read;
     }
 
+    std::string kv_admission_static_reason() const {
+        if (!model_tgt || !ctx_tgt) return "model_context_unavailable";
+        const bool any_draft_active = ctx_dft || spec || params_base.speculative.has_dft() ||
+            std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (llama_model_is_hybrid(model_tgt) && any_draft_active && !kv_admission_mtp_hybrid()) return "hybrid_target_with_draft_unsupported";
+        if (llama_model_is_recurrent(model_tgt) && !llama_model_is_hybrid(model_tgt)) return "target_recurrent_memory_unsupported";
+        if (llama_model_n_swa(model_tgt) != 0) return "target_swa_memory_unsupported";
+        if (ctx_dft || spec || params_base.speculative.has_dft()) {
+            if (kv_admission_mtp_hybrid()) {
+                // The per-context raw layout above is authoritative; shared model identity is not.
+            } else if (!kv_admission_simple_draft() || !model_dft) return "unsupported_speculative_context";
+            if (!kv_admission_mtp_hybrid() && (llama_model_is_recurrent(model_dft) || llama_model_is_hybrid(model_dft))) return "draft_recurrent_or_hybrid_memory_unsupported";
+            if (!kv_admission_mtp_hybrid() && llama_model_n_swa(model_dft) != 0) return "draft_swa_memory_unsupported";
+            if (ctx_dft && llama_n_ctx_seq(ctx_dft) < slots.size()) return "draft_context_has_fewer_sequences_than_slots";
+            if (!kv_admission_mtp_hybrid() && !model_dft) return "unsupported_speculative_context";
+        } else if (std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                    [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; })) {
+            return "unsupported_speculative_context";
+        }
+        return {};
+    }
+
+    bool kv_admission_plan_restore_enabled() const {
+        return params_base.kv_admission && kv_admission_layout_supported && params_base.kv_admission_restore;
+    }
+
+public:
+    json b3_restore_metrics() const {
+        return json {
+                {"last_target_limit_I", b3_limit.load()},
+                {"last_target_limit_by_key", json {{"attention", b3_limit.load()}, {"recurrent", b3_limit_rec.load()}}},
+                {"reservations", b3_reserved.load()},
+                {"fences", b3_fenced.load()},
+                {"releases", b3_released.load()},
+                {"active_restore_tokens", b3_reserved.load() - b3_released.load()},
+                {"executor_clears", b3_clears.load()},
+                {"plan_refusals", b3_refused.load()},
+        };
+    }
+
+private:
+    json kv_admission_descriptor() const {
+        std::string reason = kv_admission_static_reason();
+        if (reason.empty() && !kv_admission_layout_supported) reason = kv_admission_layout_reason;
+        const bool restore_enabled = kv_admission_plan_restore_enabled();
+        return json {
+            {"version", 1},
+            {"enabled", params_base.kv_admission},
+            {"admission_scope", common_kv_admission_scope_name(params_base.kv_admission_scope)},
+            {"supported", reason.empty()},
+            {"scope", kv_admission_mtp_hybrid() ? "mtp_hybrid_target_attention_recurrent_plus_mtp_attention" :
+                (kv_admission_simple_draft() ? "simple_draft_two_attention_contexts" :
+                (model_tgt && llama_model_is_hybrid(model_tgt) ? "hybrid_attention_recurrent_no_draft" :
+                 (model_tgt && llama_model_is_recurrent(model_tgt) ? "recurrent_no_draft" : "transformer_attention_no_draft")))},
+            {"effective_slot_context", slots.empty() ? 0 : slots.front().n_ctx},
+            {"parallel_slots", params_base.n_parallel},
+            {"kv_unified", params_base.kv_unified},
+            {"engine_id", slot_operations.configured_engine_id},
+            {"engine_epoch", slot_operations.engine_epoch},
+            {"reason", reason},
+            {"plan_restore", json {
+                {"enabled", restore_enabled},
+                {"cpu_fixture_only", false},
+                {"declared_keys", json {
+                    {"attention", model_tgt && (!(llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) || llama_model_is_hybrid(model_tgt))},
+                    {"recurrent", model_tgt && (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt))},
+                }},
+                {"limits_by_key", json {{"attention", b3_limit.load()}, {"recurrent", b3_limit_rec.load()}}},
+                {"reader_fences", true},
+                {"output_fences", true},
+
+            }},
+        };
+    }
+
+    void release_kv_admission_slot(int id_slot) noexcept {
+        if (id_slot < 0 || (size_t) id_slot >= kv_admission_slot_owners.size()) return;
+        auto & owner = kv_admission_slot_owners[(size_t) id_slot];
+        if (!owner) return;
+        try {
+            const auto result = kv_admission_planner.native_release(*owner);
+            if (result.status == kvplan::Status::accepted || result.status == kvplan::Status::already_released) {
+                if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+                    SRV_INF("KV_ADMISSION_TEST release task=%" PRIu64 " slot=%d status=%s ledger_before=%zu\n",
+                            owner->task, id_slot,
+                            result.status == kvplan::Status::accepted ? "released" : "already_released",
+                            kv_admission_planner.size());
+                }
+                owner.reset();
+                return;
+            }
+            SRV_ERR("KV admission native release rejected for task=%" PRIu64 " slot=%d: %s\n",
+                    owner->task, id_slot, result.reason.c_str());
+        } catch (const std::exception & e) {
+            SRV_ERR("KV admission native release failed for slot=%d: %s\n", id_slot, e.what());
+        } catch (...) {
+            SRV_ERR("KV admission native release failed for slot=%d\n", id_slot);
+        }
+        kv_admission_release_failed = true;
+    }
+
+    using kv_admission_slot_resources = std::map<std::pair<kvplan::Context, int>, std::vector<kvplan::ResourceKey>>;
+
+    bool kv_admission_snapshots(std::vector<kvplan::Snapshot> & snapshots,
+                                kv_admission_slot_resources & resource_by_slot,
+                                std::string & reason) const {
+        std::map<kvplan::ResourceKey, kvplan::Snapshot> by_resource;
+        std::map<kvplan::ResourceKey, uint32_t> stream_counts;
+        const std::array<std::pair<kvplan::Context, llama_context *>, 2> contexts = {{
+            {kvplan::Context::target, ctx_tgt}, {kvplan::Context::draft, ctx_dft}
+        }};
+        for (const auto & context : contexts) {
+            if (!context.second) continue;
+            for (const auto & slot : slots) {
+                if (slot.id < 0 || (size_t) slot.id >= kv_admission_slot_owners.size()) {
+                    reason = "invalid_native_slot_id";
+                    return false;
+                }
+                llama_memory_resource_capacity raw = {};
+                const char * fault = kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_FAULT");
+                const llama_seq_id query_seq = fault && std::strcmp(fault, "unknown") == 0 &&
+                    context.first == kvplan::Context::target && slot.id == 0 ? INT32_MAX : slot.id;
+                if (!llama_memory_get_resource_capacity(llama_get_memory(context.second), query_seq, &raw, sizeof(raw))) {
+                    reason = "unknown_memory_resource_snapshot";
+                    return false;
+                }
+                std::vector<kvplan::PhysicalView> physical;
+                const bool expect_recurrent = context.first == kvplan::Context::target &&
+                    (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt));
+                const bool expect_hybrid = context.first == kvplan::Context::target && llama_model_is_hybrid(model_tgt);
+                const bool expect_attention = !expect_recurrent || expect_hybrid;
+                const bool inject_epoch = fault && std::strcmp(fault, "epoch") == 0 && context.first == kvplan::Context::target;
+                const uint64_t snapshot_epoch = inject_epoch && kv_admission_epoch != UINT64_MAX ? kv_admission_epoch + 1 : kv_admission_epoch;
+                if (!kvplan::normalize_resources(context.first, snapshot_epoch, raw, physical) ||
+                        !kvplan::layout_matches(physical, expect_attention, expect_recurrent)) {
+                    reason = "unknown_or_invalid_memory_resource_layout";
+                    return false;
+                }
+                auto & slot_resources = resource_by_slot[std::make_pair(context.first, slot.id)];
+                const bool active = slot.is_processing();
+                const auto & owner = kv_admission_slot_owners[(size_t) slot.id];
+                if (!common_kv_admission_snapshot_owner_valid(params_base.kv_admission_scope, active, owner.has_value())) {
+                    reason = "native_owner_snapshot_mismatch";
+                    return false;
+                }
+                for (const auto & capacity : physical) {
+                    const auto key = capacity.key;
+                    slot_resources.push_back(key);
+                    if (capacity.stream_count) {
+                        const auto count = stream_counts.emplace(key, capacity.stream_count);
+                        if (!count.second && count.first->second != capacity.stream_count) {
+                            reason = "inconsistent_stream_count";
+                            return false;
+                        }
+                    }
+                    auto it = by_resource.find(key);
+                    if (it == by_resource.end()) {
+                        kvplan::Snapshot snapshot;
+                        snapshot.key = key;
+                        snapshot.known = true;
+                        snapshot.capacity = capacity.capacity;
+                        snapshot.used_real = capacity.used;
+                        it = by_resource.emplace(key, std::move(snapshot)).first;
+                    } else if (it->second.capacity != capacity.capacity || it->second.used_real != capacity.used) {
+                        reason = "inconsistent_stream_snapshot";
+                        return false;
+                    }
+                    if (active && owner.has_value()) {
+                        uint64_t total = it->second.seq_exclusive_real;
+                        const uint64_t exclusive = capacity.exclusive;
+                        if (exclusive > std::numeric_limits<uint64_t>::max() - total) {
+                            reason = "exclusive_snapshot_overflow";
+                            return false;
+                        }
+                        it->second.seq_exclusive_real = total + exclusive;
+                        kvplan::Owner snapshot_owner = *owner;
+                        const char * fault = kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_FAULT");
+                        if (fault && std::strcmp(fault, "binding") == 0 && context.first == kvplan::Context::target && slot.id == 0) {
+                            ++snapshot_owner.task;
+                        }
+                        if (!it->second.exclusive_by_owner.emplace(snapshot_owner, exclusive).second) {
+                            reason = "duplicate_native_owner";
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        snapshots.reserve(by_resource.size());
+        for (auto & item : by_resource) snapshots.push_back(std::move(item.second));
+        return true;
+    }
+
+    // Credit for the resident of the already selected, idle target slot. Proof (proposal.md): the peak counts the
+    // whole sequence (prompt+output) and update_slots runs slot.mem.seq_rm(slot, p0 <= n_past, end) on target and draft
+    // before any decode that grows the sequence, so the resident exclusive cells/rows are retired or reused first.
+    // AND semantics: every resource of the slot must be known and bound, otherwise no credit at all.
+    // Everything is staged before the planner call; nothing here mutates KV or the ledger.
+    void kv_admission_resident_credit(const server_task & task, const server_slot & slot, const kvplan::Owner & owner,
+                                      const kv_admission_slot_resources & resource_by_slot,
+                                      const kvplan::Reservation & reservation,
+                                      std::vector<kvplan::Snapshot> & snapshots) const {
+        if (task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) return;
+        if (slot.is_processing() || slot.id < 0 || (size_t) slot.id >= kv_admission_slot_owners.size() ||
+                kv_admission_slot_owners[(size_t) slot.id]) return;
+        if (task.tokens.find_next_media_chunk(0).first || slot.prompt.tokens.find_next_media_chunk(0).first) return;
+        if (owner.slot != (uint64_t) slot.id || owner.task != (uint64_t) task.id || owner.epoch != kv_admission_epoch) return;
+        std::vector<std::pair<size_t, uint64_t>> staged; // snapshot index, credit
+        const std::array<std::pair<kvplan::Context, bool>, 2> roles = {{{kvplan::Context::target, true}, {kvplan::Context::draft, ctx_dft != nullptr}}};
+        for (const auto & role : roles) {
+            if (!role.second) continue;
+            const auto resources = resource_by_slot.find({role.first, slot.id});
+            if (resources == resource_by_slot.end() || resources->second.empty()) return;
+            // Re-read the slot's own physical view at the same task boundary (both contexts already synchronized by
+            // the preflight; nothing mutates KV in between) and normalize it exactly like the snapshots.
+            llama_memory_resource_capacity raw = {};
+            std::vector<kvplan::PhysicalView> physical;
+            if (!llama_memory_get_resource_capacity(llama_get_memory(role.first == kvplan::Context::target ? ctx_tgt : ctx_dft),
+                        slot.id, &raw, sizeof(raw)) || !kvplan::normalize_resources(role.first, owner.epoch, raw, physical) ||
+                    physical.size() != resources->second.size()) return;
+            for (const auto & key : resources->second) {
+                const auto peak = reservation.peak_by_resource.find(key);
+                const auto exclusive = std::find_if(physical.begin(), physical.end(), [&key](const kvplan::PhysicalView & v) { return v.key == key; });
+                const auto snapshot = std::find_if(snapshots.begin(), snapshots.end(), [&key](const kvplan::Snapshot & v) { return v.key == key; });
+                if (peak == reservation.peak_by_resource.end() || exclusive == physical.end() ||
+                        snapshot == snapshots.end() || key.epoch != owner.epoch || exclusive->used != snapshot->used_real ||
+                        exclusive->exclusive > snapshot->used_real) return;
+                staged.emplace_back((size_t) (snapshot - snapshots.begin()), std::min<uint64_t>(exclusive->exclusive, peak->second));
+            }
+        }
+        for (const auto & item : staged) {
+            if (!item.second) continue;
+            kvplan::Owner credit_owner = owner;
+            snapshots[item.first].resident_credit_by_incoming_owner.emplace(credit_owner, item.second);
+        }
+    }
+
+    bool kv_admission_peak(const server_task & task, const server_tokens & input, const server_slot & slot,
+                           const kvplan::Owner & owner, const std::optional<kvplan::Owner> & parent,
+                           llama_context * context, const std::vector<kvplan::ResourceKey> & resources, kvplan::Reservation & out,
+                           std::string & reason, error_type & error) const {
+        if (task.id < 0 || slot.id < 0 || owner.epoch == 0 || owner.task != (uint64_t) task.id || owner.slot != (uint64_t) slot.id) {
+            reason = "invalid_native_task_or_slot_id";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        if (input.find_next_media_chunk(0).first) {
+            reason = "media_cell_layout_unsupported";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        if (slot.n_ctx <= 0 || !context) {
+            reason = "invalid_effective_context";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        const size_t input_size = input.size();
+        const uint64_t context_capacity = llama_n_ctx_seq(context);
+        if (input_size > (size_t) std::min<uint64_t>(slot.n_ctx, context_capacity)) {
+            reason = "prompt_exceeds_effective_context";
+            error = ERROR_TYPE_KV_CAPACITY;
+            return false;
+        }
+        uint64_t output = 0;
+        if (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) {
+            int32_t n_predict = task.params.n_predict;
+            if (n_predict == -1) n_predict = params_base.n_predict;
+            if (n_predict < -1) {
+                reason = "invalid_output_limit";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            const uint64_t remaining = std::min<uint64_t>(slot.n_ctx, context_capacity) - input_size;
+            output = n_predict == -1 ? remaining : (uint64_t) n_predict;
+            if (output > remaining) {
+                reason = "output_limit_exceeds_effective_context";
+                error = ERROR_TYPE_KV_CAPACITY;
+                return false;
+            }
+        } else if (task.type != SERVER_TASK_TYPE_EMBEDDING && task.type != SERVER_TASK_TYPE_RERANK) {
+            reason = "task_type_unsupported";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        const uint64_t prompt = (uint64_t) input_size;
+        if (output > std::numeric_limits<uint64_t>::max() - prompt) {
+            reason = "peak_arithmetic_overflow";
+            error = ERROR_TYPE_KV_CAPACITY;
+            return false;
+        }
+        out.owner = owner;
+        out.parent = parent;
+        llama_memory_resource_capacity raw = {};
+        if (!llama_memory_get_resource_capacity(llama_get_memory(context), slot.id, &raw, sizeof(raw))) {
+            reason = "unknown_memory_resource_snapshot";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        uint64_t lookahead = 0;
+        if (kv_admission_mtp_hybrid() && task.type == SERVER_TASK_TYPE_COMPLETION && output > 1) {
+            // MTP draft and target verification consume tokens already bounded by output.
+            // Clamp to both configured n_max and remaining output; verifier adds the sampled token.
+            const uint64_t configured = (uint64_t) std::max<int32_t>(0, params_base.speculative.draft.n_max);
+            lookahead = std::min<uint64_t>(configured, output - 1);
+            lookahead = std::min<uint64_t>(lookahead, std::min<uint64_t>(slot.n_ctx, context_capacity) - prompt - 1);
+        }
+        const uint64_t verifier = lookahead ? lookahead + 1 : 0;
+        const uint64_t attention_peak = std::max<uint64_t>(prompt + output, prompt + verifier);
+        if (attention_peak > std::min<uint64_t>(slot.n_ctx, context_capacity)) {
+            reason = "mtp_verifier_peak_exceeds_effective_context";
+            error = ERROR_TYPE_KV_CAPACITY;
+            return false;
+        }
+        for (const auto & resource : resources) {
+            uint64_t peak = attention_peak;
+            if (resource.kind == kvplan::Kind::recurrent_rows) {
+                if (!raw.recurrent_known || !raw.recurrent_rollback_groups ||
+                        raw.recurrent_rollback_groups != llama_n_rs_seq(context) + 1 ||
+                        raw.recurrent_capacity_rows % raw.recurrent_rollback_groups ||
+                        raw.recurrent_used_rows % raw.recurrent_rollback_groups) {
+                    reason = "recurrent_rollback_group_derivation_missing";
+                    error = ERROR_TYPE_KV_UNSUPPORTED;
+                    return false;
+                }
+                // Preserve the root conservative transient bound for every
+                // recurrent reservation, including no-draft, parent, and MTP.
+                peak = 2;
+            }
+            if (!out.peak_by_resource.emplace(resource, peak).second) {
+                reason = "duplicate_resource_binding";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+        }
+        error = ERROR_TYPE_KV_CAPACITY;
+        return true;
+    }
+
+
+    bool kv_admission_preflight(server_task & task, server_slot & parent_slot,
+                                const std::vector<server_slot *> & child_slots,
+                                std::string & reason, error_type & error) {
+        if (!params_base.kv_admission) return true;
+        if (common_kv_admission_plain_bypass(params_base.kv_admission_scope)) {
+            // Keep L3 fail-closed: parent/child groups must not reach unreserved pools.
+            if (!child_slots.empty()) {
+                reason = "capacity exceeded";
+                error = ERROR_TYPE_KV_CAPACITY;
+                return false;
+            }
+            if (kv_admission_release_failed) {
+                reason = "native_release_ledger_unavailable";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            return true;
+        }
+        // A memory getter is metadata only. Fence both real engines at the task boundary
+        // before observing either context, and keep dispatch serialized through commit.
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) llama_synchronize(ctx_dft);
+        if (kv_admission_release_failed) {
+            reason = "native_release_ledger_unavailable";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        reason = kv_admission_static_reason();
+        if (reason.empty() && !kv_admission_layout_supported) reason = kv_admission_layout_reason;
+        if (!reason.empty()) {
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        if (task.type == SERVER_TASK_TYPE_COMPLETION && !child_slots.empty() && task.tokens.find_next_media_chunk(0).first) {
+            reason = "media_parent_group_unsupported";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+
+        std::vector<kvplan::Snapshot> snapshots;
+        kv_admission_slot_resources resource_by_slot;
+        if (!kv_admission_snapshots(snapshots, resource_by_slot, reason)) {
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+
+        if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+            for (const auto & snapshot : snapshots) {
+                SRV_INF("KV_ADMISSION_TEST snapshot task=%d role=%s stream=%u capacity=%" PRIu64 " used=%" PRIu64
+                        " exclusive=%" PRIu64 " owners=%zu\n", task.id,
+                        snapshot.key.context == kvplan::Context::target ? "target" : "draft",
+                        snapshot.key.stream, snapshot.capacity, snapshot.used_real, snapshot.seq_exclusive_real,
+                        snapshot.exclusive_by_owner.size());
+            }
+            for (size_t i = 0; i < kv_admission_slot_owners.size(); ++i) {
+                if (kv_admission_slot_owners[i]) {
+                    const auto & owner = *kv_admission_slot_owners[i];
+                    SRV_INF("KV_ADMISSION_TEST ledger task=%d slot=%zu owner_task=%" PRIu64 " epoch=%" PRIu64 "\n",
+                            task.id, i, owner.task, owner.epoch);
+                }
+            }
+            const auto target = std::find_if(snapshots.begin(), snapshots.end(), [](const kvplan::Snapshot & s) {
+                return s.key.context == kvplan::Context::target;
+            });
+            const auto draft = std::find_if(snapshots.begin(), snapshots.end(), [](const kvplan::Snapshot & s) {
+                return s.key.context == kvplan::Context::draft;
+            });
+            if (target != snapshots.end() && draft != snapshots.end()) {
+                SRV_INF("KV_ADMISSION_TEST feasibility task=%d target_free=%" PRIu64 " draft_free=%" PRIu64 " launches=%" PRIu64 "\n",
+                        task.id, target->capacity - std::min(target->capacity, target->used_real),
+                        draft->capacity - std::min(draft->capacity, draft->used_real), kv_admission_test_launch_count);
+            }
+        }
+
+        const size_t count = 1 + child_slots.size();
+        std::vector<kvplan::Reservation> reservations;
+        std::vector<kvplan::Owner> owners;
+        std::vector<server_slot *> all_slots;
+        reservations.reserve(count);
+        owners.reserve(count);
+        all_slots.reserve(count);
+        const auto parent_owner = kvplan::Owner{kv_admission_epoch, (uint64_t) task.id, (uint64_t) parent_slot.id};
+        auto parent_resource = resource_by_slot.find({kvplan::Context::target, parent_slot.id});
+        if (parent_resource == resource_by_slot.end()) {
+            reason = "parent_stream_snapshot_missing";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        if (kv_admission_slot_owners[(size_t) parent_slot.id]) {
+            reason = "parent_slot_has_active_reservation";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        kvplan::Reservation parent_reservation;
+        if (!kv_admission_peak(task, task.tokens, parent_slot, parent_owner, std::nullopt,
+                               ctx_tgt, parent_resource->second, parent_reservation, reason, error)) return false;
+        if (ctx_dft) {
+            const auto draft_resource = resource_by_slot.find({kvplan::Context::draft, parent_slot.id});
+            if (draft_resource == resource_by_slot.end() || !kv_admission_supported_draft()) {
+                reason = "draft_resource_or_simple_binding_missing";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            if (!kv_admission_peak(task, task.tokens, parent_slot, parent_owner, std::nullopt,
+                                   ctx_dft, draft_resource->second, parent_reservation, reason, error)) return false;
+        }
+        // Only the selected parent slot is credited (children: none), computed from the pre-move reservation.
+        kv_admission_resident_credit(task, parent_slot, parent_owner, resource_by_slot,
+                                     parent_reservation, snapshots);
+        reservations.push_back(std::move(parent_reservation));
+        owners.push_back(parent_owner);
+        all_slots.push_back(&parent_slot);
+
+        if (child_slots.size() != task.child_tasks.size()) {
+            reason = "parent_child_slot_count_mismatch";
+            error = ERROR_TYPE_KV_UNSUPPORTED;
+            return false;
+        }
+        for (size_t i = 0; i < child_slots.size(); ++i) {
+            server_slot * child_slot = child_slots[i];
+            const server_task & child_task = task.child_tasks[i];
+            if (child_slot->id < 0 || (size_t) child_slot->id >= kv_admission_slot_owners.size() || kv_admission_slot_owners[(size_t) child_slot->id]) {
+                reason = "child_slot_has_active_reservation";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            auto child_resource = resource_by_slot.find({kvplan::Context::target, child_slot->id});
+            if (child_resource == resource_by_slot.end()) {
+                reason = "child_stream_snapshot_missing";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            if (child_task.id < 0 || child_task.id_parent != task.id) {
+                reason = "invalid_child_task_identity";
+                error = ERROR_TYPE_KV_UNSUPPORTED;
+                return false;
+            }
+            const auto child_owner = kvplan::Owner{kv_admission_epoch, (uint64_t) child_task.id, (uint64_t) child_slot->id};
+            kvplan::Reservation child_reservation;
+            if (!kv_admission_peak(child_task, task.tokens, *child_slot, child_owner, parent_owner,
+                                   ctx_tgt, child_resource->second, child_reservation, reason, error)) return false;
+            if (ctx_dft) {
+                const auto draft_resource = resource_by_slot.find({kvplan::Context::draft, child_slot->id});
+                if (draft_resource == resource_by_slot.end() || !kv_admission_supported_draft()) {
+                    reason = "child_draft_resource_or_simple_binding_missing";
+                    error = ERROR_TYPE_KV_UNSUPPORTED;
+                    return false;
+                }
+                if (!kv_admission_peak(child_task, task.tokens, *child_slot, child_owner, parent_owner,
+                                       ctx_dft, draft_resource->second, child_reservation, reason, error)) return false;
+            }
+            reservations.push_back(std::move(child_reservation));
+            owners.push_back(child_owner);
+            all_slots.push_back(child_slot);
+        }
+
+        if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+            for (const auto & reservation : reservations) {
+                for (const auto & peak : reservation.peak_by_resource) {
+                    const auto snapshot = std::find_if(snapshots.begin(), snapshots.end(), [&peak](const kvplan::Snapshot & s) {
+                        return s.key == peak.first;
+                    });
+                    if (snapshot != snapshots.end()) {
+                        const uint64_t free = snapshot->capacity - std::min(snapshot->capacity, snapshot->used_real);
+                        SRV_INF("KV_ADMISSION_TEST demand task=%d slot=%" PRIu64 " role=%s stream=%u peak=%" PRIu64
+                                " free_real=%" PRIu64 " independently_fits=%d\n", task.id, reservation.owner.slot,
+                                peak.first.context == kvplan::Context::target ? "target" : "draft",
+                                peak.first.stream, peak.second, free, (int) (peak.second <= free));
+                    }
+                }
+            }
+        }
+
+        kvplan::Result admitted{kvplan::Status::rejected, "planner not called"};
+        admitted = kv_admission_planner.admit(snapshots, reservations);
+        if (admitted.status != kvplan::Status::accepted) {
+            reason = admitted.reason;
+            error = ERROR_TYPE_KV_CAPACITY;
+            return false;
+        }
+        if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+            ++kv_admission_test_commit_count;
+            SRV_INF("KV_ADMISSION_TEST commit count=%" PRIu64 " task=%d reservations=%zu\n",
+                    kv_admission_test_commit_count, task.id, reservations.size());
+        }
+        for (size_t i = 0; i < all_slots.size(); ++i) {
+            kv_admission_slot_owners[(size_t) all_slots[i]->id] = owners[i];
+        }
+        if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+            SRV_INF("KV_ADMISSION_TEST admitted task=%d reservations=%zu ledger_size=%zu launches=%" PRIu64 "\n",
+                    task.id, all_slots.size(), kv_admission_planner.size(), kv_admission_test_launch_count);
+        }
+        SRV_INF("KV_ADMISSION_ACCEPTED task=%d count=%zu epoch=%" PRIu64 "\n", task.id, all_slots.size(), kv_admission_epoch);
+        return true;
+    }
+
+    void kv_admission_release_unlaunched(const std::vector<server_slot *> & candidates) noexcept {
+        for (server_slot * slot : candidates) {
+            if (slot && !slot->is_processing()) release_kv_admission_slot(slot->id);
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -3017,6 +4131,33 @@ private:
             return false;
         }
 
+        // Any exceptional exit of a started slot writer must still become terminal
+        // after the native output fence. Deferred/yield-declined tasks remain live.
+        struct slot_writer_guard {
+            slot_operation_registry & registry;
+            std::string id;
+            llama_context * target;
+            llama_context * draft;
+            ~slot_writer_guard() {
+                if (id.empty()) return;
+                try {
+                    slot_operation_record op;
+                    if (!registry.get(id, op) || op.status != "running") return;
+                    llama_synchronize(target);
+                    if (draft) llama_synchronize(draft);
+                    registry.finish(id, "failed", nullptr, "slot writer exited before publishing a terminal result");
+                } catch (...) { /* do not replace the original exception */ }
+            }
+        } writer_guard{slot_operations, task.slot_action.operation_id, ctx_tgt, ctx_dft};
+
+        if (params_base.kv_admission && !kv_admission_plan_restore_enabled() &&
+                task.type == SERVER_TASK_TYPE_SLOT_RESTORE) {
+            if (!task.slot_action.operation_id.empty()) {
+                slot_operations.finish(task.slot_action.operation_id, "failed", {}, "KV admission B1 blocks slot restore writers");
+            }
+            send_error(task, "KV admission B1 blocks slot restore path", ERROR_TYPE_KV_UNSUPPORTED);
+            return true;
+        }
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -3041,6 +4182,14 @@ private:
                     }
 
                     const int id_task = task.id;
+                    if (params_base.kv_admission && (task.id < 0 || task.id_slot < -1 ||
+                            (task.id_slot >= 0 && (size_t) task.id_slot >= slots.size()))) {
+                        send_error(task, "KV admission refused: invalid_native_task_or_slot_id", ERROR_TYPE_KV_UNSUPPORTED);
+                        for (const auto & child : task.child_tasks) {
+                            send_error(child, "KV admission refused: invalid_native_task_or_slot_id", ERROR_TYPE_KV_UNSUPPORTED);
+                        }
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -3062,22 +4211,104 @@ private:
                         break;
                     }
 
+                    std::vector<server_slot *> child_slots;
                     if (task.is_parent()) {
-                        // try getting free slots for all child tasks
-                        size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        // Reserve the whole parent group before any child is launched.
+                        const size_t n_child_tasks = task.child_tasks.size();
+                        child_slots = get_free_slots(n_child_tasks, slot->id);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
-                        if (!launch_slots_with_parent_task(*slot, child_slots, std::move(task))) {
-                            SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
-                            break; // drop the task
+                    }
+
+                    // Prepare launch bookkeeping before committing reservations.
+                    std::vector<server_slot *> attempted;
+                    try {
+                        attempted.reserve(1 + child_slots.size());
+                        attempted.push_back(slot);
+                        attempted.insert(attempted.end(), child_slots.begin(), child_slots.end());
+                    } catch (const std::bad_alloc &) {
+                        send_error(task, "KV admission refused: launch_bookkeeping_allocation_failure", ERROR_TYPE_KV_CAPACITY);
+                        for (const auto & child : task.child_tasks) {
+                            send_error(child, "KV admission refused: launch_bookkeeping_allocation_failure", ERROR_TYPE_KV_CAPACITY);
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                        break;
+                    }
+
+                    if (params_base.kv_admission) {
+                        std::string reason;
+                        error_type error = ERROR_TYPE_KV_UNSUPPORTED;
+                        bool admitted = false;
+                        try {
+                            admitted = kv_admission_preflight(task, *slot, child_slots, reason, error);
+                        } catch (const std::bad_alloc &) {
+                            reason = "admission_allocation_failure";
+                            error = ERROR_TYPE_KV_CAPACITY;
+                        }
+                        if (!admitted) {
+                            // A preflight exception after commit must not strand unlaunched owners.
+                            kv_admission_release_unlaunched(attempted);
+                            if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_TRACE")) {
+                                SRV_INF("KV_ADMISSION_TEST refused task=%d reason=%s launches=%" PRIu64 " ledger_release_failed=%d\n",
+                                        task.id, reason.c_str(), kv_admission_test_launch_count,
+                                        (int) kv_admission_release_failed);
+                                std::vector<kvplan::Snapshot> after;
+                                kv_admission_slot_resources resources_after;
+                                std::string after_reason;
+                                if (kv_admission_snapshots(after, resources_after, after_reason)) {
+                                    for (const auto & snapshot : after) {
+                                        SRV_INF("KV_ADMISSION_TEST after_refusal task=%d role=%s stream=%u capacity=%" PRIu64 " used=%" PRIu64
+                                                " exclusive=%" PRIu64 " owners=%zu\n", task.id,
+                                                snapshot.key.context == kvplan::Context::target ? "target" : "draft",
+                                                snapshot.key.stream, snapshot.capacity, snapshot.used_real, snapshot.seq_exclusive_real,
+                                                snapshot.exclusive_by_owner.size());
+                                    }
+                                } else {
+                                    SRV_INF("KV_ADMISSION_TEST after_refusal_snapshot_unavailable task=%d reason=%s\n",
+                                            task.id, after_reason.c_str());
+                                }
+                                for (size_t i = 0; i < kv_admission_slot_owners.size(); ++i) {
+                                    if (kv_admission_slot_owners[i]) {
+                                        const auto & owner = *kv_admission_slot_owners[i];
+                                        SRV_INF("KV_ADMISSION_TEST after_refusal_ledger task=%d slot=%zu owner_task=%" PRIu64 " epoch=%" PRIu64 "\n",
+                                                task.id, i, owner.task, owner.epoch);
+                                    }
+                                }
+                                SRV_INF("KV_ADMISSION_TEST after_refusal_ledger_size task=%d size=%zu\n", task.id,
+                                        kv_admission_planner.size());
+                            }
+                            send_error(task, "KV admission refused: " + reason, error);
+                            for (const auto & child : task.child_tasks) {
+                                send_error(child, "KV admission refused: " + reason, error);
+                            }
+                            break;
+                        }
+                    }
+
+                    bool launched = false;
+                    try {
+                        if (task.is_parent()) {
+                            launched = launch_slots_with_parent_task(*slot, child_slots, std::move(task));
+                        } else {
+                            launched = launch_slot_with_task(*slot, std::move(task));
+                        }
+                    } catch (const std::exception & e) {
+                        for (server_slot * attempted_slot : attempted) {
+                            if (attempted_slot && attempted_slot->is_processing()) attempted_slot->release();
+                        }
+                        kv_admission_release_unlaunched(attempted);
+                        send_error(id_task, std::string("Failed to launch task: ") + e.what(), ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    if (!launched) {
+                        for (server_slot * attempted_slot : attempted) {
+                            if (attempted_slot && attempted_slot->is_processing()) attempted_slot->release();
+                        }
+                        kv_admission_release_unlaunched(attempted);
+                        SRV_ERR("failed to launch slot group, id_task = %d\n", id_task);
+                        break;
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -3196,6 +4427,26 @@ private:
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
 
+                    // The opt-in integration gate observes mutable admission state
+                    // only here, on the same loop that owns slots and the ledger.
+                    if (kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_DRIVER") ||
+                            kv_admission_cpu_test_env("LLAMA_KV_ADMISSION_TEST_OBSERVE")) {
+                        json owners = json::array();
+                        for (size_t i = 0; i < kv_admission_slot_owners.size(); ++i) {
+                            if (kv_admission_slot_owners[i]) {
+                                const auto & owner = *kv_admission_slot_owners[i];
+                                owners.push_back({{"epoch", owner.epoch}, {"task", owner.task}, {"slot", owner.slot}});
+                            }
+                        }
+                        res->kv_admission_test_snapshot = {
+                            {"launch_count", kv_admission_test_launch_count},
+                            {"commit_count", kv_admission_test_commit_count},
+                            {"ledger_size", kv_admission_planner.size()},
+                            {"release_failed", kv_admission_release_failed},
+                            {"owners", std::move(owners)},
+                        };
+                    }
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3228,15 +4479,19 @@ private:
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Invalid slot ID");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        slot_operations.set_status(task.slot_action.operation_id, "deferred");
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    slot_operations.set_status(task.slot_action.operation_id, "running");
 
                     const int64_t t_start = ggml_time_us();
 
@@ -3247,6 +4502,7 @@ private:
                     try {
                         packed = slot->prompt.tokens.serialize();
                     } catch (const std::exception & err) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, err.what());
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
@@ -3256,18 +4512,21 @@ private:
                         ctx_tgt, filepath.c_str(), slot->id,
                         reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
                     if (nwrite == 0) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Unable to save slot");
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
 
                     size_t nwrite_ckpt = 0;
                     if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Incomplete context checkpoints");
                         send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
                         break;
                     }
 
                     size_t nwrite_dft = 0;
                     if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Incomplete draft state");
                         send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
                         break;
                     }
@@ -3283,6 +4542,7 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
                     res->t_ms     = t_save_ms;
+                    slot_operations.finish(task.slot_action.operation_id, "completed", res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -3290,56 +4550,261 @@ private:
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Invalid slot ID");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        slot_operations.set_status(task.slot_action.operation_id, "deferred");
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    slot_operations.set_status(task.slot_action.operation_id, "running");
 
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    llama_tokens tokens;
+                    tokens.resize(slot->n_ctx);
+                    size_t token_count = 0;
+
+                    // When kv_admission is active, plan_restore reserves resources BEFORE
+                    // clearing prior slot state. Clear occurs only after an admitted plan.
+                    std::unique_ptr<kvplan::RestorePlan> rplan;
+                    std::optional<kvplan::Owner> restore_owner;
+                    kvplan::RestoreKeyMap tgt_keys, dft_keys; // (kind,stream) -> key; no single-key fallback
+                    std::vector<kvplan::ResourceKey> declared;
+                    struct RestoreLease {
+                        kvplan::Planner * planner = nullptr;
+                        kvplan::RestorePlan * plan = nullptr;
+                        kvplan::Owner * owner = nullptr;
+                        llama_context * target = nullptr;
+                        llama_context * draft = nullptr;
+                        bool released = false;
+                        std::atomic<uint64_t> * fences = nullptr;
+                        std::atomic<uint64_t> * releases = nullptr;
+                        void release() noexcept {
+                            if (released || !planner || !plan || !owner) return;
+                            llama_synchronize(target);
+                            if (draft) llama_synchronize(draft);
+                            const bool fenced = planner->fence_restore(plan->token);
+                            if (fenced && fences) ++*fences;
+                            const auto result = planner->native_release(*owner);
+                            if (result.status == kvplan::Status::accepted && releases) ++*releases;
+                            SRV_INF("B3_RESTORE fence=%d release=%d ledger=%zu\n", fenced,
+                                    result.status == kvplan::Status::accepted, planner->size());
+                            released = true;
+                        }
+                        ~RestoreLease() { release(); }
+                    } lease{&kv_admission_planner, nullptr, nullptr, ctx_tgt, ctx_dft, false, &b3_fenced, &b3_released};
+
+                    if (kv_admission_plan_restore_enabled()) {
+                        llama_synchronize(ctx_tgt);
+                        if (ctx_dft) llama_synchronize(ctx_dft);
+
+                        std::string snap_reason;
+                        std::vector<kvplan::Snapshot> snapshots;
+                        kv_admission_slot_resources resource_by_slot;
+                        if (!kv_admission_snapshots(snapshots, resource_by_slot, snap_reason)) {
+                            llama_synchronize(ctx_tgt);
+                            if (ctx_dft) llama_synchronize(ctx_dft);
+                            slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Snapshot derivation failed: " + snap_reason);
+                            send_error(task, "KV admission snapshot failed", ERROR_TYPE_KV_UNSUPPORTED);
+                            break;
+                        }
+
+                        const auto tgt_it = resource_by_slot.find({kvplan::Context::target, slot->id});
+                        if (tgt_it == resource_by_slot.end()) {
+                            llama_synchronize(ctx_tgt);
+                            if (ctx_dft) llama_synchronize(ctx_dft);
+                            slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Missing target resource key");
+                            send_error(task, "Missing target resource key", ERROR_TYPE_KV_UNSUPPORTED);
+                            break;
+                        }
+                        const bool tgt_rec = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+                        const bool tgt_att = !tgt_rec || llama_model_is_hybrid(model_tgt);
+                        auto refuse_restore = [&](const std::string & why) {
+                            ++b3_refused;
+                            SRV_INF("B3_RESTORE plan_refused=%s clears=%" PRIu64 "\n", why.c_str(), b3_clears.load());
+                            llama_synchronize(ctx_tgt);
+                            if (ctx_dft) llama_synchronize(ctx_dft);
+                            slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "KV admission restore refused: " + why);
+                            send_error(task, "KV admission restore refused: " + why, ERROR_TYPE_KV_CAPACITY);
+                        };
+                        {
+                            // (kind,stream)->key map of the destination slot: hybrid = attention + recurrent. Any key of an
+                            // unknown kind, duplicate pair or missing declared kind is refused_unsupported_layout, zero clear.
+                            bool ok = true;
+                            for (const auto & k : tgt_it->second) ok = tgt_keys.add(k) && ok;
+                            ok = ok && tgt_keys.keys.size() == size_t(tgt_att) + size_t(tgt_rec) &&
+                                 tgt_keys.has(kvplan::Kind::attention_cells) == tgt_att && tgt_keys.has(kvplan::Kind::recurrent_rows) == tgt_rec;
+                            if (ctx_dft) {
+                                const auto dft_it = resource_by_slot.find({kvplan::Context::draft, slot->id});
+                                if (dft_it != resource_by_slot.end()) {
+                                    for (const auto & k : dft_it->second) {
+                                        if (k.kind == kvplan::Kind::attention_cells) ok = dft_keys.add(k) && ok;
+                                    }
+                                }
+                            }
+                            if (!ok || !kvplan::restore_declared_keys(resource_by_slot, tgt_att, tgt_rec, ctx_dft != nullptr, declared)) {
+                                refuse_restore("refused_unsupported_layout: target key map differs from declared layout");
+                                break;
+                            }
+                        }
+
+                        restore_owner = kvplan::Owner{kv_admission_epoch, (uint64_t) task.id, (uint64_t) slot->id};
+                        // CPU-only negative fixture: exercise a genuine typed-plan refusal.
+#ifdef LLAMA_B3_CPU_FIXTURES
+                        const char * refuse = std::getenv("LLAMA_B3_CPU_REFUSE_PLAN_ONCE");
+                        static std::atomic<bool> refused_once{false};
+                        if (refuse && std::string(refuse) == "1" && !refused_once.exchange(true) && !snapshots.empty()) {
+                            snapshots.front().known = false;
+                            SRV_WRN("%s\n", "B3_CPU_UNKNOWN_SNAPSHOT injected");
+                        }
+#endif
+                        if (tgt_rec) {
+                            // D1: replacement credit of the destination's own recurrent cells, from its physical view.
+                            llama_memory_resource_capacity raw = {};
+                            std::vector<kvplan::PhysicalView> dest;
+                            std::string credit_reason;
+                            if (!llama_memory_get_resource_capacity(llama_get_memory(ctx_tgt), slot->id, &raw, sizeof(raw)) ||
+                                    !kvplan::normalize_resources(kvplan::Context::target, kv_admission_epoch, raw, dest) ||
+                                    !kvplan::apply_restore_credit(dest, *restore_owner, snapshots, credit_reason)) {
+                                refuse_restore("refused_unsupported_layout: " + (credit_reason.empty() ? std::string("destination view unknown") : credit_reason));
+                                break;
+                            }
+                        }
+#ifdef LLAMA_B3_LIMIT_FIXTURE
+                        // TEST-ONLY (never compiled in production): force the restore limit I of the target resource
+                        // (attention / recurrent) to an exact value by faking the physical occupancy seen by the planner.
+                        // Planner, ledger and loader logic are untouched.
+                        for (const auto & fx : {std::make_pair("LLAMA_B3_FIXTURE_RESTORE_LIMIT", kvplan::Kind::attention_cells),
+                                                std::make_pair("LLAMA_B3_FIXTURE_RESTORE_LIMIT_REC", kvplan::Kind::recurrent_rows)}) {
+                            if (const char * force = std::getenv(fx.first)) {
+                                char * end = nullptr;
+                                const unsigned long long n = std::strtoull(force, &end, 10);
+                                if (end != force && *end == 0 && kvplan::apply_limit_fixture(snapshots, fx.second, n)) {
+                                    SRV_WRN("B3_LIMIT_FIXTURE %s forced limit_I=%llu\n", fx.first, n);
+                                }
+                            }
+                        }
+#endif
+                        rplan = std::make_unique<kvplan::RestorePlan>(kv_admission_planner.plan_restore(snapshots, *restore_owner, declared));
+                        if (rplan->kind != kvplan::RestorePlan::Kind::ok) {
+                            ++b3_refused;
+                            SRV_INF("B3_RESTORE plan_refused=%s clears=%" PRIu64 "\n", rplan->reason.c_str(), b3_clears.load());
+                            // Budget or admission refused: ZERO clear performed, prior slot state remains intact.
+                            llama_synchronize(ctx_tgt);
+                            if (ctx_dft) llama_synchronize(ctx_dft);
+                            slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "KV admission restore refused: " + rplan->reason);
+                            send_error(task, "KV admission restore refused: " + rplan->reason, ERROR_TYPE_KV_CAPACITY);
+                            break;
+                        }
+                        ++b3_reserved;
+                        b3_limit = 0; b3_limit_rec = 0;
+                        for (const auto & item : tgt_keys.keys) {
+                            const uint64_t lim = rplan->token.limit(item.second).value_or(0);
+                            (item.second.kind == kvplan::Kind::recurrent_rows ? b3_limit_rec : b3_limit) = lim;
+                        }
+                        SRV_INF("B3_RESTORE reserved limit_I=%" PRIu64 " limit_rec=%" PRIu64 " ledger=%zu\n", b3_limit.load(), b3_limit_rec.load(), kv_admission_planner.size());
+                        lease.plan = rplan.get();
+                        lease.owner = &*restore_owner;
+                    }
+
+                    // A restore is a replacement transaction. Remove prior target, draft,
+                    // checkpoint and speculative carry state only after bounded snapshot validation.
+                    bool restore_mutated = false;
+                    if (!rplan) slot->clear_after_restore_failure();
+
                     size_t nread = 0;
-                    try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
+                    if (rplan != nullptr) {
+                        struct RestoreConsumerBridge {
+                            kvplan::Planner * planner;
+                            kvplan::RestoreToken * token;
+                            kvplan::RestoreKeyMap map;
+                            server_slot * slot;
+                            std::atomic<uint64_t> * clears;
+                            uint64_t unmapped = 0;
+                            static void begin_cb(void * user) {
+                                auto * bridge = static_cast<RestoreConsumerBridge *>(user);
+                                ++*bridge->clears;
+                                bridge->slot->clear_after_restore_failure();
+                            }
+                            static bool consume_cb(void * user, uint32_t kind, uint32_t stream, uint64_t count) {
+                                auto * bridge = static_cast<RestoreConsumerBridge *>(user);
+                                return kvplan::restore_consume(*bridge->planner, *bridge->token, bridge->map, kind, stream, count, bridge->unmapped);
+                            }
+                        } bridge{&kv_admission_planner, &rplan->token, tgt_keys, slot, &b3_clears};
 
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+                        struct llama_state_seq_limits limits{};
+                        limits.user = &bridge;
+                        limits.consume = RestoreConsumerBridge::consume_cb;
+                        limits.before_replace = RestoreConsumerBridge::begin_cb;
+                        limits.max_tensor_bytes = llama_state_seq_restore_tensor_capacity(ctx_tgt);
+                        limits.max_snapshot_bytes = llama_state_seq_restore_file_capacity(ctx_tgt, slot->id);
 
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+                        nread = llama_state_seq_load_file_bounded(ctx_tgt, filepath.c_str(), slot->id,
+                                                                 tokens.data(), tokens.size(), &token_count, &limits);
+                        restore_mutated = limits.mutation_started;
+                        if (bridge.unmapped) SRV_WRN("B3_RESTORE refused charge for pair without key count=%" PRIu64 "\n", bridge.unmapped);
+                    } else {
+                        // v4 packs media into token words; its payload may exceed n_ctx even
+                        // when the restored prompt fits. Preserve upstream's size-query API.
+                        const size_t header = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &token_count);
+                        if (header) {
+                            tokens.resize(std::max<size_t>(1, token_count));
+                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                         }
+                    }
 
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
+#ifdef LLAMA_B3_CPU_FIXTURES
+                    if (nread > 0 && kv_admission_plan_restore_enabled()) {
+                        const char * fault = std::getenv("LLAMA_B3_CPU_FAIL_AFTER_RESTORE_READ");
+                        static std::atomic<bool> injected{false};
+                        if (fault != nullptr && std::string(fault) == "1" && !injected.exchange(true)) {
+                            SRV_WRN("%s\n", "B3_CPU_FAULT_AFTER_RESTORE_READ injected");
+                            nread = 0;
                         }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                    } catch (const std::exception & err) {
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+                    }
+#endif
+                    if (nread == 0) {
+                        if (!rplan || restore_mutated) slot->clear_after_restore_failure();
+                        lease.release();
+                        SRV_INF("%s\n", "B3_RESTORE terminal=failed after_fence");
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Unable to restore slot state");
+                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
-                    // nread is the end offset of the llama state payload within the file
+
+                    tokens.resize(token_count);
+                    slot->prompt.clear();
+                    try {
+                        auto restored = server_tokens::deserialize(tokens, mctx != nullptr);
+                        if (restored.size() > (size_t) slot->n_ctx || !restored.validate(ctx_tgt)) {
+                            throw std::runtime_error("Invalid tokens in slot save file");
+                        }
+                        slot->prompt.tokens = std::move(restored);
+                    } catch (const std::exception & err) {
+                        slot->clear_after_restore_failure();
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, err.what());
+                        send_error(task, err.what(), ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, *slot);
-                    const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, *slot);
+                    const size_t nread_dft = load_slot_draft(filepath, nread + nread_ckpt, *slot);
+
+                    // Native output fence (R3): synchronizes target and draft contexts
+                    // before releasing admission token and publishing completed status.
+                    llama_synchronize(ctx_tgt);
+                    if (ctx_dft) llama_synchronize(ctx_dft);
+
+                    lease.release();
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3352,6 +4817,7 @@ private:
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nread + nread_ckpt + nread_dft;
                     res->t_ms     = t_restore_ms;
+                    slot_operations.finish(task.slot_action.operation_id, "completed", res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -3359,25 +4825,32 @@ private:
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
+                        slot_operations.finish(task.slot_action.operation_id, "failed", nullptr, "Invalid slot ID");
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        slot_operations.set_status(task.slot_action.operation_id, "deferred");
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
+                    slot_operations.set_status(task.slot_action.operation_id, "running");
+
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear();
+                    slot->clear_after_restore_failure();
+                    llama_synchronize(ctx_tgt);
+                    if (ctx_dft) llama_synchronize(ctx_dft);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    slot_operations.finish(task.slot_action.operation_id, "completed", res->to_json());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -3854,6 +5327,19 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        int n_gen_slots = 0;
+        iterate(slots, [&](server_slot & slot) {
+            n_gen_slots += slot.state == SLOT_STATE_GENERATING;
+        });
+        // LLAMA_SPEC_MAX_SLOTS=N (default 0 = no limit): no new drafts while more than N slots are
+        // generating. With several users the verify batches leave the small-batch decode kernels and
+        // drafting costs more than it saves. Port of the production knob.
+        static const int spec_max_slots = [] { const char * e = getenv("LLAMA_SPEC_MAX_SLOTS"); return e ? atoi(e) : 0; }();
+        const bool spec_skip = spec_max_slots > 0 && n_gen_slots > spec_max_slots;
+        const int spec_nmax_step = spec_nmax_solo <= 0 ? 0 :
+            (n_gen_slots <= 1 ? spec_nmax_solo :
+             (spec_nmax_multi > 0 ? spec_nmax_multi : spec_nmax_preset));
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3879,7 +5365,11 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                // a slot with a partial draft to reuse keeps it; only new drafts are skipped
+                int n_draft_max = spec_skip && slot.spec_draft.empty() ? 0 : slot.get_n_draft_max();
+                if (spec_nmax_step > 0) {
+                    n_draft_max = std::min(n_draft_max, spec_nmax_step);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3989,6 +5479,11 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // Limit only mixed prompt/decode work; never alter configured context, KV or slots.
+        static const int32_t decode_prio_prompt_tokens = server_decode_prio_prompt_tokens(
+            std::getenv("NVIDIA_IK_DECODE_PRIO_PROMPT_TOKENS"));
+        n_batch = server_decode_prio_batch_limit(n_batch, batch.size(), decode_prio_prompt_tokens);
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -4978,6 +6473,7 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 
+
                 GGML_ASSERT(accepted.size() >= 1);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
@@ -4987,12 +6483,15 @@ private:
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > llama_n_rs_seq(ctx_tgt));
 
+
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
+
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
@@ -5039,6 +6538,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            slot.mtp_adapt.update(n_draft, n_accepted);
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
@@ -5237,6 +6737,7 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
 
+
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
@@ -5274,6 +6775,7 @@ server_context_meta server_context::get_meta() const {
         /* json_ui_settings        */ impl->json_ui_settings,
         /* slot_n_ctx              */ impl->n_ctx_slot(),
         /* pooling_type            */ llama_pooling_type(impl->ctx_tgt),
+        /* kv_admission           */ impl->kv_admission_descriptor(),
 
         /* chat_params             */ impl->chat_params,
         /* chat_template_caps      */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
@@ -5694,6 +7196,18 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
+static json server_state_contract() {
+    return json {
+        {"contract", "mainline-v1.0.0+fork-" + std::string(llama_commit())},
+        {"family", "mainline-v1.0.0+fork"},
+        {"state_version", LLAMA_STATE_SEQ_VERSION},
+        {"read_versions", json::array({LLAMA_STATE_SEQ_VERSION})},
+        {"write_versions", json::array({LLAMA_STATE_SEQ_VERSION})},
+        {"compat_v2", false},
+        {"kv_layout", "upstream-v1.0.0-rotation"},
+    };
+}
+
 static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -5729,6 +7243,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "bos_token",                   meta.bos_token_str },
         { "eos_token",                   meta.eos_token_str },
         { "build_info",                  meta.build_info },
+        { "kv_admission",                meta.kv_admission },
+        { "state_contract",              server_state_contract() },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };
@@ -5879,6 +7395,9 @@ void server_routes::init_routes() {
 
         auto * res_task = dynamic_cast<server_task_result_slots*>(result.get());
         GGML_ASSERT(res_task != nullptr);
+        if (!res_task->kv_admission_test_snapshot.is_null()) {
+            res->headers["X-KV-Admission-Test-Snapshot"] = res_task->kv_admission_test_snapshot.dump();
+        }
 
         // optionally return "fail_on_no_slot" error
         if (!req.get_param("fail_on_no_slot").empty()) {
@@ -5889,6 +7408,65 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_slot_operations = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (params.slot_save_path.empty()) {
+            res->error(json{{"code", 501}, {"message", "slot operation protocol is disabled"}});
+            return res;
+        }
+        if (params.slot_operation_owner.empty() || params.slot_operation_engine_id.empty()) {
+            res->error(json{{"code", 501}, {"message", "slot operation owner or engine ID is not configured"}});
+            return res;
+        }
+        auto capability = ctx_server.slot_operations.capability();
+        capability["state_contract"] = server_state_contract();
+        capability["b3_restore"] = ctx_server.b3_restore_metrics();
+        res->ok(capability);
+        return res;
+    };
+
+    this->get_slot_operation = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        slot_operation_record op;
+        if (!ctx_server.slot_operations.get(req.get_param("op_id"), op)) {
+            res->error(json{{"code", 404}, {"message", "unknown slot operation"}});
+            return res;
+        }
+        res->ok(op.to_json());
+        return res;
+    };
+
+    this->post_slot_operation_ack = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        try {
+            const json body = json::parse(req.body);
+            const std::string engine_id = body.at("engine_id").get<std::string>();
+            const std::string owner = body.at("owner").get<std::string>();
+            const std::string epoch = body.at("engine_epoch").get<std::string>();
+            const uint64_t seq = body.at("owner_seq").get<uint64_t>();
+            if (seq == 0) {
+                res->error(json{{"code", 400}, {"message", "owner_seq must be positive"}});
+                return res;
+            }
+            if (owner != ctx_server.slot_operations.owner_name() || engine_id != ctx_server.slot_operations.configured_engine_id) {
+                res->error(json{{"code", 409}, {"message", "engine_id or owner does not match this configured endpoint"}});
+                return res;
+            }
+            const auto code = ctx_server.slot_operations.ack(owner, req.get_param("op_id"), epoch, seq);
+            if (code == slot_operation_registry::ack_code::accepted || code == slot_operation_registry::ack_code::repeated || code == slot_operation_registry::ack_code::old_epoch) {
+                res->status = 204;
+                res->data.clear();
+            } else if (code == slot_operation_registry::ack_code::nonterminal) {
+                res->error(json{{"code", 409}, {"message", "operation is not terminal"}});
+            } else {
+                res->error(json{{"code", 404}, {"message", "unknown slot operation"}});
+            }
+        } catch (const std::exception & e) {
+            res->error(json{{"code", 400}, {"message", e.what()}});
+        }
         return res;
     };
 
@@ -5910,6 +7488,35 @@ void server_routes::init_routes() {
         }
 
         std::string action = req.get_param("action");
+
+        // Preserve the upstream API only when the fenced protocol is not configured.
+        // Once an owner/engine is configured, no untracked writer may bypass its ledger.
+        if (params.slot_operation_engine_id.empty()) {
+            if (action != "save" && action != "restore" && action != "erase") {
+                res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            server_task task(action == "save" ? SERVER_TASK_TYPE_SLOT_SAVE :
+                             action == "restore" ? SERVER_TASK_TYPE_SLOT_RESTORE : SERVER_TASK_TYPE_SLOT_ERASE);
+            task.id = res->rd.get_new_id();
+            task.slot_action.id_slot = id_slot;
+            if (action != "erase") {
+                const json body = json::parse(req.body);
+                const std::string filename = body.at("filename").get<std::string>();
+                if (!fs_validate_filename(filename)) {
+                    res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                task.slot_action.filename = filename;
+                task.slot_action.filepath = params.slot_save_path + filename;
+            }
+            res->rd.post_task(std::move(task));
+            auto result = res->rd.next(req.should_stop);
+            if (!result) return res;
+            if (result->is_error()) res->error(result->to_json());
+            else res->ok(result->to_json());
+            return res;
+        }
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);
@@ -6692,13 +8299,46 @@ void server_routes::init_routes() {
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
     auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
+    json request_data;
+    std::string filename, op_id, engine_epoch, owner, engine_id;
+    uint64_t owner_seq = 0;
+    try {
+        request_data = json::parse(req.body);
+        filename = request_data.at("filename").get<std::string>();
+        op_id = request_data.at("op_id").get<std::string>();
+        owner = request_data.at("owner").get<std::string>();
+        engine_id = request_data.at("engine_id").get<std::string>();
+        engine_epoch = request_data.at("engine_epoch").get<std::string>();
+        owner_seq = request_data.at("owner_seq").get<uint64_t>();
+    } catch (const std::exception & e) {
+        res->error(json{{"code", 400}, {"message", e.what()}});
+        return res;
+    }
+    if (owner != ctx_server.slot_operations.owner_name() || engine_id != ctx_server.slot_operations.configured_engine_id) {
+        res->error(json{{"code", 409}, {"message", "engine_id or owner does not match this configured endpoint"}});
+        return res;
+    }
     if (!fs_validate_filename(filename)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+
+    slot_operation_record op;
+    const std::string payload = json{{"action", "save"}, {"slot", id_slot}, {"filename", filename}}.dump();
+    const auto submit = ctx_server.slot_operations.submit(op_id, owner_seq, engine_epoch, engine_id, "save", id_slot, filename, payload, op);
+    if (submit == slot_operation_registry::submit_code::conflict) {
+        res->error(json{{"code", 409}, {"message", "stale sequence, epoch, owner, op_id, or payload conflict"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::overloaded) {
+        res->error(json{{"code", 503}, {"message", "slot operation capacity reached; retry after ACK"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::exact_retry) {
+        res->ok(op.to_json());
+        return res;
+    }
 
     auto & rd = res->rd;
     {
@@ -6707,6 +8347,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.operation_id = op_id;
+        task.slot_action.owner_seq = owner_seq;
         rd.post_task(std::move(task));
     }
 
@@ -6717,24 +8359,57 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         return res;
     }
 
-    if (result->is_error()) {
-        res->error(result->to_json());
+    slot_operation_record final_op;
+    if (!ctx_server.slot_operations.get(op_id, final_op)) {
+        res->error(json{{"code", 500}, {"message", "slot operation result was lost"}});
         return res;
     }
-
-    res->ok(result->to_json());
+    res->ok(final_op.to_json());
     return res;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const server_http_req & req, int id_slot) {
     auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
+    json request_data;
+    std::string filename, op_id, engine_epoch, owner, engine_id;
+    uint64_t owner_seq = 0;
+    try {
+        request_data = json::parse(req.body);
+        filename = request_data.at("filename").get<std::string>();
+        op_id = request_data.at("op_id").get<std::string>();
+        owner = request_data.at("owner").get<std::string>();
+        engine_id = request_data.at("engine_id").get<std::string>();
+        engine_epoch = request_data.at("engine_epoch").get<std::string>();
+        owner_seq = request_data.at("owner_seq").get<uint64_t>();
+    } catch (const std::exception & e) {
+        res->error(json{{"code", 400}, {"message", e.what()}});
+        return res;
+    }
+    if (owner != ctx_server.slot_operations.owner_name() || engine_id != ctx_server.slot_operations.configured_engine_id) {
+        res->error(json{{"code", 409}, {"message", "engine_id or owner does not match this configured endpoint"}});
+        return res;
+    }
     if (!fs_validate_filename(filename)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+
+    slot_operation_record op;
+    const std::string payload = json{{"action", "restore"}, {"slot", id_slot}, {"filename", filename}}.dump();
+    const auto submit = ctx_server.slot_operations.submit(op_id, owner_seq, engine_epoch, engine_id, "restore", id_slot, filename, payload, op);
+    if (submit == slot_operation_registry::submit_code::conflict) {
+        res->error(json{{"code", 409}, {"message", "stale sequence, epoch, owner, op_id, or payload conflict"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::overloaded) {
+        res->error(json{{"code", 503}, {"message", "slot operation capacity reached; retry after ACK"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::exact_retry) {
+        res->ok(op.to_json());
+        return res;
+    }
 
     auto & rd = res->rd;
     {
@@ -6743,6 +8418,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.operation_id = op_id;
+        task.slot_action.owner_seq = owner_seq;
         rd.post_task(std::move(task));
     }
 
@@ -6753,23 +8430,56 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
 
-    if (result->is_error()) {
-        res->error(result->to_json());
+    slot_operation_record final_op;
+    if (!ctx_server.slot_operations.get(op_id, final_op)) {
+        res->error(json{{"code", 500}, {"message", "slot operation result was lost"}});
         return res;
     }
-
-    GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
-    res->ok(result->to_json());
+    res->ok(final_op.to_json());
     return res;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const server_http_req & req, int id_slot) {
     auto res = create_response();
+    std::string op_id, engine_epoch, owner, engine_id;
+    uint64_t owner_seq = 0;
+    try {
+        const json body = json::parse(req.body);
+        op_id = body.at("op_id").get<std::string>();
+        owner = body.at("owner").get<std::string>();
+        engine_id = body.at("engine_id").get<std::string>();
+        engine_epoch = body.at("engine_epoch").get<std::string>();
+        owner_seq = body.at("owner_seq").get<uint64_t>();
+    } catch (const std::exception & e) {
+        res->error(json{{"code", 400}, {"message", e.what()}});
+        return res;
+    }
+    if (owner != ctx_server.slot_operations.owner_name() || engine_id != ctx_server.slot_operations.configured_engine_id) {
+        res->error(json{{"code", 409}, {"message", "engine_id or owner does not match this configured endpoint"}});
+        return res;
+    }
+    slot_operation_record op;
+    const std::string payload = json{{"action", "erase"}, {"slot", id_slot}}.dump();
+    const auto submit = ctx_server.slot_operations.submit(op_id, owner_seq, engine_epoch, engine_id, "erase", id_slot, "", payload, op);
+    if (submit == slot_operation_registry::submit_code::conflict) {
+        res->error(json{{"code", 409}, {"message", "stale sequence, epoch, owner, op_id, or payload conflict"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::overloaded) {
+        res->error(json{{"code", 503}, {"message", "slot operation capacity reached; retry after ACK"}});
+        return res;
+    }
+    if (submit == slot_operation_registry::submit_code::exact_retry) {
+        res->ok(op.to_json());
+        return res;
+    }
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.operation_id = op_id;
+        task.slot_action.owner_seq = owner_seq;
         rd.post_task(std::move(task));
     }
 
@@ -6780,13 +8490,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
         return res;
     }
 
-    if (result->is_error()) {
-        res->error(result->to_json());
+    slot_operation_record final_op;
+    if (!ctx_server.slot_operations.get(op_id, final_op)) {
+        res->error(json{{"code", 500}, {"message", "slot operation result was lost"}});
         return res;
     }
-
-    GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
-    res->ok(result->to_json());
+    res->ok(final_op.to_json());
     return res;
 }
 

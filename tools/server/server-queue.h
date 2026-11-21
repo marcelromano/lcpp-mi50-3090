@@ -46,6 +46,7 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<void(const server_task &)> callback_task_cancelled;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -125,6 +126,10 @@ public:
     // note: while yielding, the callback runs on worker thread, not main thread
     void on_new_task(std::function<bool(server_task &&, bool)> callback) {
         callback_new_task = std::move(callback);
+    }
+
+    void on_task_cancelled(std::function<void(const server_task &)> callback) {
+        callback_task_cancelled = std::move(callback);
     }
 
     // Register the function to be called when all slots data is ready to be processed

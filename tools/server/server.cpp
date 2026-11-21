@@ -1,10 +1,18 @@
 #include "server-connect.h"
 #include "server-context.h"
+#include <cstdlib>
+
+// CPU integration instrumentation is absent unless explicitly compiled in.
+static const char * kv_admission_cpu_test_env(const char * name) {
+    (void) name;
+    return nullptr;
+}
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include <cpp-httplib/httplib.h>
 
 #include "arg.h"
 #include "build-info.h"
@@ -28,6 +36,7 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -217,6 +226,9 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.get ("/slot-operations",           ex_wrapper(routes.get_slot_operations));
+    ctx_http.get ("/slot-operations/:op_id",    ex_wrapper(routes.get_slot_operation));
+    ctx_http.post("/slot-operations/:op_id/ack", ex_wrapper(routes.post_slot_operation_ack));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -547,6 +559,9 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_lora_adapters          = models_routes->proxy_post;
     routes.get_slots                   = models_routes->proxy_get;
     routes.post_slots                  = models_routes->proxy_post;
+    routes.get_slot_operations         = models_routes->proxy_get;
+    routes.get_slot_operation          = models_routes->proxy_get;
+    routes.post_slot_operation_ack     = models_routes->proxy_post;
 
     // custom routes for router
     routes.get_props                   = models_routes->get_router_props;
