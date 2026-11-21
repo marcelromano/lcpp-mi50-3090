@@ -1970,6 +1970,18 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
+
+            // capture the decode/verify graph slots of a typical request before serving, so that
+            // the first request does not pay the cold graph capture (positions are removed afterwards)
+            const int warmup_steps    = std::getenv("LLAMA_DECODE_WARMUP")          ? std::atoi(std::getenv("LLAMA_DECODE_WARMUP"))          : 8;
+            const int warmup_prefill  = std::getenv("LLAMA_DECODE_WARMUP_PREFILL") ? std::atoi(std::getenv("LLAMA_DECODE_WARMUP_PREFILL")) : 512;
+            if (warmup_steps > 0 && warmup_prefill > 0) {
+                const int64_t t_warmup_start = ggml_time_us();
+                const bool warmup_ok = common_speculative_warmup(spec.get(), ctx_tgt, ctx_dft, 0, warmup_prefill, warmup_steps);
+                SRV_INF("decode graph warm-up: prefill = %d, steps = %d, ok = %d, %.0f ms\n",
+                        warmup_prefill, warmup_steps, (int) warmup_ok,
+                        (ggml_time_us() - t_warmup_start) / 1000.0);
+            }
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
