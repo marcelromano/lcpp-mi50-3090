@@ -11,10 +11,12 @@
 class llama_memory_hybrid_idx_context;
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068
+// uma op (L2_NORM) em vez de rms_norm + scale. A composicao anterior
+//   rms_norm(x, eps/n) * 1/sqrt(n) e algebricamente x/sqrt(sum(x^2)+eps), que e o que o
+//   ggml_l2_norm faz; a linha prod/mi50 (produção anterior) ja usava ggml_l2_norm aqui, e com a
+//   op unica o backend CUDA funde o par q+k no l2_norm2_f32 (-3 kernels por camada GDN/passo).
 static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
-    const float n = x->ne[0];
-
-    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+    return ggml_l2_norm(ctx, x, eps);
 }
 
 //

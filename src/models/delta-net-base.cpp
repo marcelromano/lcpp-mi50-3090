@@ -97,12 +97,25 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const bool keep = cparams.n_rs_seq > 0;
 
+#ifdef GGML_EXP_GDN_NOGATHER
+    // s is a [S_v, S_v, H_v, 1] view of the whole cache (see qwen35*.cpp): the GDN indexes the cell via s_copy_main
+    const bool gdn_by_ids = n_seqs == 1 && s->view_src == ssm_states_all && s->view_offs == 0;
+#endif
+
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
+#ifdef GGML_EXP_GDN_NOGATHER
+        if (gdn_by_ids) {
+            // s is a view of the whole cache: only valid if the GDN node consumed it directly (fused path)
+            ggml_tensor * gdn = new_state->view_src;
+            GGML_ASSERT(gdn && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[5] == s);
+            gdn->src[6] = inp->s_copy_main;
+        }
+#endif
 
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,

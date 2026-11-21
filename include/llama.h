@@ -814,6 +814,43 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Physical attention-KV occupancy for the stream holding seq_id.
+    // This is an observation, not an admission lease or total hybrid memory.
+    // Call from the same thread that mutates memory. Unsupported layouts return false.
+    struct llama_memory_seq_capacity {
+        uint32_t stream_id;
+        uint32_t stream_count;
+        uint32_t capacity_cells;
+        uint32_t used_cells;
+        uint32_t seq_cells;
+        uint32_t seq_exclusive_cells;
+    };
+    LLAMA_API bool llama_memory_get_seq_capacity(
+            llama_memory_t mem, llama_seq_id seq_id, struct llama_memory_seq_capacity * out);
+
+    // Physical resources owned by the actual memory object. Recurrent row counts
+    // multiply occupied/available cells by recurrent_rollback_groups; groups are
+    // preallocated state rows, not tokens. A hybrid result is atomic: both known
+    // flags are set together or the whole result is unknown. Counts are observations,
+    // not reservations. Call on the memory's engine thread.
+    struct llama_memory_resource_capacity {
+        bool attention_known;
+        uint32_t attention_stream_id;
+        uint32_t attention_stream_count;
+        uint32_t attention_capacity_cells;
+        uint32_t attention_used_cells;
+        uint32_t attention_seq_cells;
+        uint32_t attention_seq_exclusive_cells;
+        bool recurrent_known;
+        uint32_t recurrent_capacity_rows;
+        uint32_t recurrent_used_rows;
+        uint32_t recurrent_seq_rows;
+        uint32_t recurrent_seq_exclusive_rows;
+        uint32_t recurrent_rollback_groups;
+    };
+    LLAMA_API bool llama_memory_get_resource_capacity(
+            llama_memory_t mem, llama_seq_id seq_id, struct llama_memory_resource_capacity * out, size_t out_size);
+
     //
     // State / sessions
     //
@@ -890,6 +927,33 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+
+    // per-operation engine authority, carried by the real I/O object through
+    // hybrid/attention/recurrent readers. Kind 0=attention cells, 1=recurrent rows.
+    // Caller retains its native reservation until this call's output fence.
+    struct llama_state_seq_limits {
+        void * user;
+        bool (*consume)(void * user, uint32_t kind, uint32_t stream, uint64_t count);
+        // Called once after immutable snapshot validation, before replacement.
+        void (*before_replace)(void * user);
+        uint64_t max_tensor_bytes;
+        uint64_t max_snapshot_bytes; // 0 selects the derived physical-format bound
+        // Trusted native fault hook for CPU fixtures; never populated by HTTP.
+        bool (*before_tensor_write)(void * user, uint64_t cumulative_bytes);
+        uint64_t clear_count;
+        uint64_t allocation_count;
+        uint64_t fence_count;
+        bool mutation_started;
+        bool limit_refused;
+    };
+    LLAMA_API size_t llama_state_seq_load_file_bounded(
+            struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
+            llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out,
+            struct llama_state_seq_limits * limits);
+    // Sum of the real memory module's allocated buffer bytes; zero=unknown.
+    LLAMA_API uint64_t llama_state_seq_restore_tensor_capacity(struct llama_context * ctx);
+    LLAMA_API uint64_t llama_state_seq_restore_file_capacity(struct llama_context * ctx, llama_seq_id seq);
+
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat
@@ -903,6 +967,23 @@ extern "C" {
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
+
+    // Context-owned bounded pool per source sequence. A lease remains valid across checkpoint
+    // copies and context destruction; release it before its storage can be reused.
+    struct llama_state_seq_device;
+    LLAMA_API struct llama_state_seq_device * llama_state_seq_device_acquire(
+            struct llama_context * ctx, llama_seq_id seq_id, size_t limit);
+    LLAMA_API void llama_state_seq_device_free(struct llama_state_seq_device * device);
+    LLAMA_API size_t llama_state_seq_device_get(
+            struct llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id,
+            llama_state_seq_flags flags, struct llama_state_seq_device * device);
+    LLAMA_API size_t llama_state_seq_device_set(
+            struct llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id,
+            llama_state_seq_flags flags, const struct llama_state_seq_device * device);
+    // dst == NULL queries the host-format size; otherwise materialize without touching live state.
+    LLAMA_API size_t llama_state_seq_device_to_host(
+            const struct llama_state_seq_device * device, const uint8_t * src, size_t size,
+            uint8_t * dst, size_t capacity);
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

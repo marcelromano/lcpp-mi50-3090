@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <string>
+#include <cstdint>
 #include <unordered_set>
 #include <list>
 #include <map>
@@ -198,6 +199,8 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string operation_id;
+        uint64_t owner_seq = 0;
     };
     slot_action slot_action;
 
@@ -618,6 +621,7 @@ struct server_task_result_metrics : server_task_result {
     int n_tasks_deferred = 0;
 
     server_metrics metrics;
+    json kv_admission_test_snapshot = nullptr;
 
     virtual json to_json() override;
 
@@ -636,6 +640,9 @@ struct server_task_result_slots : server_task_result {
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
+    // Test-only snapshot copied on the dispatcher thread and exposed only by the
+    // opt-in integration driver. It is deliberately not part of production APIs.
+    json kv_admission_test_snapshot = nullptr;
 
     virtual json to_json() override;
 };
@@ -646,6 +653,10 @@ struct server_task_result_slot_save_load : server_task_result {
 
     size_t n_tokens;
     size_t n_bytes;
+#ifdef LLAMA_EXP_SLOT_DFT
+    size_t n_bytes_dft = 0; // experimental: bytes of the draft (MTP) state file
+#endif
+    size_t n_checkpoints = 0;
     double t_ms;
 
     virtual json to_json() override;

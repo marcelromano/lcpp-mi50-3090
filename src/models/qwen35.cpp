@@ -36,12 +36,22 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const auto nf = nextn_flags(ml);
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
+    const bool mtp_only   = (nf.trunk & TENSOR_NOT_REQUIRED) != 0;
+
+    int64_t n_vocab_out = n_vocab;
+    const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
+    if (mtp_only && d2t_meta) {
+        n_vocab_out = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_out }, 0);
+        LLAMA_LOG_INFO("%s: QWEN35 MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n",
+                __func__, (long long) n_vocab_out);
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_out }, TENSOR_NOT_REQUIRED);
 
     // optional projection of the embeddings output
     cls_out   = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), { n_embd, hparams.n_embd_out() }, TENSOR_NOT_REQUIRED);
@@ -49,6 +59,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
+        GGML_ASSERT(!d2t && "d2t draft-vocab trim requires output.weight");
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -122,7 +133,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab_out }, mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
@@ -264,9 +275,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, qkv_mixed); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+#ifdef GGML_EXP_Q8_SHARE
+    if (ubatch.n_tokens <= 8) ggml_build_forward_expand(gf, z); // keep sibling matmuls adjacent so the CUDA backend can share one q8_1 quantization
+#endif
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -418,15 +435,48 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
+#ifdef GGML_EXP_COLA
+    // ik-style conv chain: keep concat, (view, cpy) x K, ssm_conv, silu contiguous in the node list so the
+    // CUDA backend can run them as one kernel (the kernel reads the state and writes the K snapshots itself)
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+    if (n_seq_tokens <= 8) {
+        ggml_build_forward_expand(gf, conv_output_silu);
+    }
+#endif // GGML_EXP_COLA
+
+#ifdef GGML_EXP_GDN_NOGATHER
+    // no gather: the GDN kernel reads the cell selected by s_copy_main straight from the cache (src[6])
+    const bool gdn_by_ids = n_seqs == 1 && n_seq_tokens <= 8 && cparams.fused_gdn_ar && cparams.fused_gdn_ch;
+    ggml_tensor * state;
+    if (gdn_by_ids) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs,
+            [](ggml_context * c, ggml_tensor * s, ggml_tensor *) {
+                return ggml_view_2d(c, s, s->ne[0], s->ne[1], s->nb[1], 0);
+            });
+        state = ggml_view_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, 1,
+                head_v_dim*sizeof(float), head_v_dim*head_v_dim*sizeof(float),
+                hparams.n_embd_s()*sizeof(float), 0);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    }
+#else
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+#endif // GGML_EXP_GDN_NOGATHER
+    cb(state, "state_predelta", il);
+
+#ifndef GGML_EXP_COLA
+    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    cb(conv_output_proper, "conv_output_raw", il);
+
+    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    cb(conv_output_silu, "conv_output_silu", il);
+#endif // GGML_EXP_COLA
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -664,6 +714,28 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
+
+    if (model.d2t) {
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I32 || model.d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+        // The meta backend cannot set_rows along a split vocabulary axis.
+        // In tensor mode, keep the backend result compact; llama_context
+        // expands it on the host. Preserve the original single-GPU graph.
+        if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+            ggml_tensor * logits = ggml_fill(ctx0,
+                    ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+            cur = ggml_set_rows(ctx0, logits,
+                    ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
+            cb(cur, "result_output_d2t", -1);
+        }
+    }
 
     res->t_logits = cur;
 }

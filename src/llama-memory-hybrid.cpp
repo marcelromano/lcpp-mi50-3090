@@ -1,4 +1,5 @@
 #include "llama-memory-hybrid.h"
+#include "llama-io.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -188,6 +189,47 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+bool llama_memory_hybrid::get_seq_capacity(llama_seq_id seq_id, llama_memory_seq_capacity & out) const {
+    // This deliberately describes only the attention component, not recurrent state.
+    return mem_attn->get_seq_capacity(seq_id, out);
+}
+
+bool llama_memory_hybrid::get_resource_capacity(llama_seq_id seq_id, llama_memory_resource_capacity & out) const {
+    out = {};
+    llama_memory_resource_capacity attention = {};
+    llama_memory_resource_capacity recurrent = {};
+    if (!mem_attn->get_resource_capacity(seq_id, attention) ||
+            !mem_recr->get_resource_capacity(seq_id, recurrent)) {
+        return false;
+    }
+    return llama_memory_compose_resource_capacity(attention, recurrent, out);
+}
+
+bool llama_memory_compose_resource_capacity(
+        const llama_memory_resource_capacity & attention,
+        const llama_memory_resource_capacity & recurrent,
+        llama_memory_resource_capacity & out) {
+    out = {};
+    if (!attention.attention_known || attention.recurrent_known ||
+            !recurrent.recurrent_known || recurrent.attention_known) {
+        return false;
+    }
+    out.attention_known = true;
+    out.attention_stream_id = attention.attention_stream_id;
+    out.attention_stream_count = attention.attention_stream_count;
+    out.attention_capacity_cells = attention.attention_capacity_cells;
+    out.attention_used_cells = attention.attention_used_cells;
+    out.attention_seq_cells = attention.attention_seq_cells;
+    out.attention_seq_exclusive_cells = attention.attention_seq_exclusive_cells;
+    out.recurrent_known = true;
+    out.recurrent_capacity_rows = recurrent.recurrent_capacity_rows;
+    out.recurrent_used_rows = recurrent.recurrent_used_rows;
+    out.recurrent_seq_rows = recurrent.recurrent_seq_rows;
+    out.recurrent_seq_exclusive_rows = recurrent.recurrent_seq_exclusive_rows;
+    out.recurrent_rollback_groups = recurrent.recurrent_rollback_groups;
+    return true;
+}
+
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     mem_attn->state_write(io, seq_id, flags);
     mem_recr->state_write(io, seq_id, flags);
@@ -199,8 +241,8 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     try {
         mem_recr->state_read(io, seq_id, flags);
     } catch (...) {
-        // a failed restore leaves the sequence empty in both caches
-        mem_attn->state_clear(seq_id);
+        // Execution failure empties both caches; immutable validation is read-only.
+        if (io.restore_should_cleanup()) mem_attn->state_clear(seq_id);
 
         throw;
     }

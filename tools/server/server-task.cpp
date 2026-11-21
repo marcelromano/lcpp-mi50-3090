@@ -1671,6 +1671,10 @@ json server_task_result_slot_save_load::to_json() {
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+#ifdef LLAMA_EXP_SLOT_DFT
+            { "n_written_dft", n_bytes_dft },
+#endif
+            { "n_checkpoints", n_checkpoints },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1682,6 +1686,10 @@ json server_task_result_slot_save_load::to_json() {
         { "filename",   filename },
         { "n_restored", n_tokens },
         { "n_read",     n_bytes },
+#ifdef LLAMA_EXP_SLOT_DFT
+        { "n_read_dft", n_bytes_dft },
+#endif
+        { "n_checkpoints", n_checkpoints },
         { "timings", {
             { "restore_ms", t_ms }
         }},
@@ -1805,10 +1813,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     common_state_data state_data_tgt;
     common_state_data state_data_dft;
 
-    // check if we can allocate enough memory for the new state
+    // RAM entries may share native host checkpoints, but must not pin the bounded device pool.
+    auto checkpoints = prompt.checkpoints;
     try {
         state_data_tgt.resize(state_size_tgt);
         state_data_dft.resize(state_size_dft);
+        for (auto & checkpoint : checkpoints) {
+            if (!checkpoint->device_tgt && !checkpoint->device_dft) continue;
+            auto host = std::make_shared<common_prompt_checkpoint>(*checkpoint);
+            host->to_host();
+            checkpoint = std::move(host);
+        }
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1824,7 +1839,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
