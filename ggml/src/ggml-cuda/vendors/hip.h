@@ -269,6 +269,14 @@ typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
+#if defined(GGML_EXP_VSUBSS)
+// SWAR byte-wise wraparound subtraction: every caller subtracts a small constant from small
+// non-negative nibbles/6-bit values, so saturation is never reached
+static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
+    const unsigned int ua = a, ub = b;
+    return (int)(((ua | 0x80808080u) - (ub & 0x7f7f7f7fu)) ^ ((ua ^ ~ub) & 0x80808080u));
+}
+#else
 static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
     const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
     const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
@@ -288,7 +296,15 @@ static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
     return reinterpret_cast<int &>(c);
 #endif // __has_builtin(__builtin_elementwise_sub_sat)
 }
+#endif
 
+#if defined(GGML_EXP_VSUB)
+// SWAR byte-wise wraparound subtraction; callers only negate small grid values, no saturation needed
+static __device__ __forceinline__ int __vsub4(const int a, const int b) {
+    const unsigned int ua = a, ub = b;
+    return (int)(((ua | 0x80808080u) - (ub & 0x7f7f7f7fu)) ^ ((ua ^ ~ub) & 0x80808080u));
+}
+#else
 static __device__ __forceinline__ int __vsub4(const int a, const int b) {
     // do some small modifications to a and b to make the subtraction not underflow
     const unsigned int a_large = a | 0x80808080;
@@ -300,6 +316,7 @@ static __device__ __forceinline__ int __vsub4(const int a, const int b) {
 
     return result_low_7bits ^ should_flip_high_1bit;
 }
+#endif
 
 static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
     const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
@@ -313,6 +330,13 @@ static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigne
     return c;
 }
 
+#if defined(GGML_EXP_VCMP)
+static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+    const unsigned int x = a ^ b;
+    const unsigned int t = ((((x & 0x7f7f7f7fu) + 0x7f7f7f7fu) | x) & 0x80808080u);
+    return (t >> 7) * 0xffu;
+}
+#else
 static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
     const unsigned int x = a ^ b;
 
@@ -325,7 +349,11 @@ static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigne
     return (ne_any_bit >> 7) * 0xff;
 }
 
+#endif
+
 // v_perm_b32 with selector bytes in [0, 7]: 0-3 pick bytes of lo, 4-7 pick bytes of hi.
+// hoisted out of the `#else` branch of GGML_EXP_VCMP — vecdotq.cuh/mmq-load-tiles.cuh call it
+// unconditionally under GGML_USE_HIP, so defining GGML_EXP_VCMP used to break the build.
 static __device__ __forceinline__ uint32_t ggml_hip_perm(const uint32_t hi, const uint32_t lo, const uint32_t sel) {
 #if __has_builtin(__builtin_amdgcn_is_invocable)
     if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_perm)) {

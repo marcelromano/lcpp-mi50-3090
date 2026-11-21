@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -221,6 +222,267 @@ static __global__ void ggml_cuda_ar_add_kernel(
     }
 }
 
+// P2P direct-write kernels: Phase 1 converts/packs local shard (or 0 when inactive)
+// directly into peer's device receive buffer over PCIe; Phase 2 performs the exact
+// symmetric wire accumulation float(Q(dst)) + float(peer_wire) so rank 0 and rank 1
+// remain bitwise identical with upstream #27825.
+template <typename T_src, typename T_wire>
+static __global__ void ggml_cuda_ar_p2p_write_kernel(
+        const T_src * __restrict__ src,
+        T_wire      * __restrict__ peer_wire,
+        int count,
+        bool active) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    if constexpr (std::is_same_v<T_src, float> && std::is_same_v<T_wire, nv_bfloat16>) {
+        if ((count & 1) == 0 &&
+            ((reinterpret_cast<uintptr_t>(src) & 7u) == 0) &&
+            ((reinterpret_cast<uintptr_t>(peer_wire) & 3u) == 0)) {
+            const int pairs = count >> 1;
+            const float2 * src2 = reinterpret_cast<const float2 *>(src);
+            uint32_t * dst2 = reinterpret_cast<uint32_t *>(peer_wire);
+            for (int k = tid; k < pairs; k += nt) {
+                const float2 v = active ? src2[k] : make_float2(0.0f, 0.0f);
+                union { nv_bfloat16 h[2]; uint32_t u; } pk;
+                pk.h[0] = ggml_cuda_cast<nv_bfloat16>(v.x);
+                pk.h[1] = ggml_cuda_cast<nv_bfloat16>(v.y);
+                dst2[k] = pk.u;
+            }
+            return;
+        }
+    }
+    for (int i = tid; i < count; i += nt) {
+        peer_wire[i] = active ? ggml_cuda_cast<T_wire>(src[i]) : ggml_cuda_cast<T_wire>(0.0f);
+    }
+}
+
+template <typename T_dst, typename T_wire>
+static __global__ void ggml_cuda_ar_p2p_sym_add_kernel(
+        T_dst        * __restrict__ dst,
+        const T_wire * __restrict__ peer_wire,
+        int count,
+        bool active) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    if constexpr (std::is_same_v<T_dst, float> && std::is_same_v<T_wire, nv_bfloat16>) {
+        if ((count & 1) == 0 &&
+            ((reinterpret_cast<uintptr_t>(dst) & 7u) == 0) &&
+            ((reinterpret_cast<uintptr_t>(peer_wire) & 3u) == 0)) {
+            const int pairs = count >> 1;
+            float2 * dst2 = reinterpret_cast<float2 *>(dst);
+            const uint32_t * peer2 = reinterpret_cast<const uint32_t *>(peer_wire);
+            for (int k = tid; k < pairs; k += nt) {
+                const float2 cur = active ? dst2[k] : make_float2(0.0f, 0.0f);
+                union { uint32_t u; nv_bfloat16 h[2]; } pk;
+                pk.u = peer2[k];
+                const nv_bfloat16 l0 = ggml_cuda_cast<nv_bfloat16>(cur.x);
+                const nv_bfloat16 l1 = ggml_cuda_cast<nv_bfloat16>(cur.y);
+                float2 out;
+                out.x = ggml_cuda_cast<float>(l0) + ggml_cuda_cast<float>(pk.h[0]);
+                out.y = ggml_cuda_cast<float>(l1) + ggml_cuda_cast<float>(pk.h[1]);
+                dst2[k] = out;
+            }
+            return;
+        }
+    }
+    for (int i = tid; i < count; i += nt) {
+        const T_wire d_low = active ? ggml_cuda_cast<T_wire>(dst[i]) : ggml_cuda_cast<T_wire>(0.0f);
+        dst[i] = ggml_cuda_cast<T_dst>(
+            ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(peer_wire[i]));
+    }
+}
+
+static constexpr int    GGML_CUDA_AR_FUSED_MAX_BLOCKS = 64;
+static constexpr int    GGML_CUDA_AR_FUSED_THREADS    = 256;
+static constexpr size_t GGML_CUDA_AR_FUSED_HALF_BYTES = 256 * 1024;
+
+// Uncached GPU-side arrival flags + monotonic step counter per block.
+struct alignas(128) ggml_cuda_ar_fused_signal {
+    uint32_t start[GGML_CUDA_AR_FUSED_MAX_BLOCKS][2];
+    uint32_t end[GGML_CUDA_AR_FUSED_MAX_BLOCKS][2];
+    uint32_t flag[GGML_CUDA_AR_FUSED_MAX_BLOCKS];
+};
+
+static __device__ __forceinline__ uint32_t ggml_cuda_ar_sys_load_acq(const uint32_t * addr) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(addr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *reinterpret_cast<const volatile uint32_t *>(addr);
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_ar_sys_store_rel(uint32_t * addr, uint32_t val) {
+#if defined(GGML_USE_HIP)
+    __hip_atomic_store(addr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    __threadfence_system();
+    *reinterpret_cast<volatile uint32_t *>(addr) = val;
+#endif
+}
+
+template <typename T_uncached>
+static __device__ __forceinline__ T_uncached ggml_cuda_ar_uncached_load(const T_uncached * addr) {
+#if defined(GGML_USE_HIP)
+    return __hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    return *reinterpret_cast<const volatile T_uncached *>(addr);
+#endif
+}
+
+template <typename T_dst, typename T_wire>
+__launch_bounds__(GGML_CUDA_AR_FUSED_THREADS)
+static __global__ void ggml_cuda_ar_fused_kernel(
+        T_dst                      * __restrict__ data,
+        size_t                                    ne,
+        int                                       rank,
+        bool                                      active,
+        ggml_cuda_ar_fused_signal  * __restrict__ self_sg,
+        ggml_cuda_ar_fused_signal  * __restrict__ peer_sg,
+        uint8_t                    * __restrict__ self_stage,
+        uint8_t                    * __restrict__ peer_stage) {
+    const int peer = 1 - rank;
+    __shared__ uint32_t s_flag;
+    if (threadIdx.x == 0) {
+        s_flag = self_sg->flag[blockIdx.x] + 1u;
+    }
+    __syncthreads();
+    const uint32_t flag    = s_flag;
+    const uint32_t buf_idx = flag & 1u;
+
+    uint8_t *       peer_slot = peer_stage + (size_t) buf_idx * GGML_CUDA_AR_FUSED_HALF_BYTES;
+    const uint8_t * self_slot = self_stage + (size_t) buf_idx * GGML_CUDA_AR_FUSED_HALF_BYTES;
+
+    // All eligible inputs have (nbytes & 0xF) == 0, which guarantees (ne & 3u) == 0.
+    const size_t n_q   = ne >> 2;
+    const size_t q_beg = (size_t(blockIdx.x) * n_q) / gridDim.x;
+    const size_t q_end = (size_t(blockIdx.x + 1) * n_q) / gridDim.x;
+
+    if constexpr (std::is_same_v<T_dst, float> && std::is_same_v<T_wire, nv_bfloat16>) {
+#if defined(GGML_USE_HIP)
+        // production-style vector packet, retained in VGPRs across the barrier.
+        // Native symmetric BF16 rounding is preserved, including inactive ranks.
+        // Only take this path when each lane owns at most one vector.
+        if (q_end - q_beg <= blockDim.x) {
+            const size_t i = q_beg + threadIdx.x;
+            const bool valid = i < q_end;
+            union { nv_bfloat16 h[4]; uint64_t u; } local;
+            const float4 f = valid && active ? reinterpret_cast<const float4 *>(data)[i] : make_float4(0,0,0,0);
+            local.h[0] = ggml_cuda_cast<nv_bfloat16>(f.x);
+            local.h[1] = ggml_cuda_cast<nv_bfloat16>(f.y);
+            local.h[2] = ggml_cuda_cast<nv_bfloat16>(f.z);
+            local.h[3] = ggml_cuda_cast<nv_bfloat16>(f.w);
+            if (valid) reinterpret_cast<uint64_t *>(peer_slot)[i] = local.u;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence_system();
+                ggml_cuda_ar_sys_store_rel(&peer_sg->start[blockIdx.x][rank], flag);
+                while (int32_t(ggml_cuda_ar_sys_load_acq(&self_sg->start[blockIdx.x][peer]) - flag) < 0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+                    __builtin_amdgcn_s_sleep(1);
+#endif
+                }
+            }
+            __syncthreads();
+            if (valid) {
+                union { uint64_t u; nv_bfloat16 h[4]; } remote;
+                remote.u = ggml_cuda_ar_uncached_load(&reinterpret_cast<const uint64_t *>(self_slot)[i]);
+                float4 result;
+                result.x = ggml_cuda_cast<float>(local.h[0]) + ggml_cuda_cast<float>(remote.h[0]);
+                result.y = ggml_cuda_cast<float>(local.h[1]) + ggml_cuda_cast<float>(remote.h[1]);
+                result.z = ggml_cuda_cast<float>(local.h[2]) + ggml_cuda_cast<float>(remote.h[2]);
+                result.w = ggml_cuda_cast<float>(local.h[3]) + ggml_cuda_cast<float>(remote.h[3]);
+                reinterpret_cast<float4 *>(data)[i] = result;
+            }
+        } else
+#endif
+        {
+        const float4 * __restrict__ src_v4 = reinterpret_cast<const float4 *>(data);
+        float4       * __restrict__ dst_v4 = reinterpret_cast<float4 *>(data);
+        uint64_t     * __restrict__ peer_w = reinterpret_cast<uint64_t *>(peer_slot);
+        const uint64_t * __restrict__ self_w = reinterpret_cast<const uint64_t *>(self_slot);
+
+        for (size_t i = q_beg + threadIdx.x; i < q_end; i += blockDim.x) {
+            const float4 f = active ? src_v4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            union { nv_bfloat16 h[4]; uint64_t u; } pk;
+            pk.h[0] = ggml_cuda_cast<nv_bfloat16>(f.x);
+            pk.h[1] = ggml_cuda_cast<nv_bfloat16>(f.y);
+            pk.h[2] = ggml_cuda_cast<nv_bfloat16>(f.z);
+            pk.h[3] = ggml_cuda_cast<nv_bfloat16>(f.w);
+            peer_w[i] = pk.u;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            ggml_cuda_ar_sys_store_rel(&peer_sg->start[blockIdx.x][rank], flag);
+            while (int32_t(ggml_cuda_ar_sys_load_acq(&self_sg->start[blockIdx.x][peer]) - flag) < 0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+        __syncthreads();
+
+        for (size_t i = q_beg + threadIdx.x; i < q_end; i += blockDim.x) {
+            union { uint64_t u; nv_bfloat16 h[4]; } pk;
+            pk.u = ggml_cuda_ar_uncached_load(&self_w[i]);
+            const float4 f = active ? src_v4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const nv_bfloat16 l0 = ggml_cuda_cast<nv_bfloat16>(f.x);
+            const nv_bfloat16 l1 = ggml_cuda_cast<nv_bfloat16>(f.y);
+            const nv_bfloat16 l2 = ggml_cuda_cast<nv_bfloat16>(f.z);
+            const nv_bfloat16 l3 = ggml_cuda_cast<nv_bfloat16>(f.w);
+            float4 out;
+            out.x = ggml_cuda_cast<float>(l0) + ggml_cuda_cast<float>(pk.h[0]);
+            out.y = ggml_cuda_cast<float>(l1) + ggml_cuda_cast<float>(pk.h[1]);
+            out.z = ggml_cuda_cast<float>(l2) + ggml_cuda_cast<float>(pk.h[2]);
+            out.w = ggml_cuda_cast<float>(l3) + ggml_cuda_cast<float>(pk.h[3]);
+            dst_v4[i] = out;
+        }
+        }
+    } else {
+        using wire_bits_t = std::conditional_t<sizeof(T_wire) == 4, uint32_t, uint16_t>;
+        T_wire       * __restrict__ peer_w = reinterpret_cast<T_wire *>(peer_slot);
+        const T_wire * __restrict__ self_w = reinterpret_cast<const T_wire *>(self_slot);
+
+        const size_t e_beg = q_beg << 2;
+        const size_t e_end = q_end << 2;
+        for (size_t i = e_beg + threadIdx.x; i < e_end; i += blockDim.x) {
+            peer_w[i] = active ? ggml_cuda_cast<T_wire>(data[i]) : ggml_cuda_cast<T_wire>(0.0f);
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            ggml_cuda_ar_sys_store_rel(&peer_sg->start[blockIdx.x][rank], flag);
+            while (int32_t(ggml_cuda_ar_sys_load_acq(&self_sg->start[blockIdx.x][peer]) - flag) < 0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+                __builtin_amdgcn_s_sleep(1);
+#endif
+            }
+        }
+        __syncthreads();
+
+        for (size_t i = e_beg + threadIdx.x; i < e_end; i += blockDim.x) {
+            const wire_bits_t raw = ggml_cuda_ar_uncached_load(reinterpret_cast<const wire_bits_t *>(&self_w[i]));
+            T_wire pval;
+            std::memcpy(&pval, &raw, sizeof(T_wire));
+            const T_wire d_low = active ? ggml_cuda_cast<T_wire>(data[i]) : ggml_cuda_cast<T_wire>(0.0f);
+            data[i] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(pval));
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        self_sg->flag[blockIdx.x] = flag;
+        ggml_cuda_ar_sys_store_rel(&peer_sg->end[blockIdx.x][rank], flag);
+        while (int32_t(ggml_cuda_ar_sys_load_acq(&self_sg->end[blockIdx.x][peer]) - flag) < 0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+            __builtin_amdgcn_s_sleep(1);
+#endif
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
@@ -335,6 +597,48 @@ struct ggml_cuda_ar_pipeline {
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
+
+    // P2P event direct-write staging: 8x 256 KiB small slots + 1x 16 MiB large chunk buffer per GPU.
+    static constexpr int    P2P_SMALL_SLOTS = 8;
+    static constexpr size_t P2P_SMALL_BYTES = 256 * 1024;
+    static constexpr size_t P2P_LARGE_BYTES = 16 * 1024 * 1024;
+
+    bool        enable_p2p;
+    bool        p2p_ready;
+    uint8_t *   p2p_small_buf[GGML_CUDA_MAX_DEVICES];
+    uint8_t *   p2p_large_buf[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t p2p_staged[GGML_CUDA_MAX_DEVICES][P2P_SMALL_SLOTS];
+    cudaEvent_t p2p_done[GGML_CUDA_MAX_DEVICES][P2P_SMALL_SLOTS];
+    cudaEvent_t p2p_staged_large[GGML_CUDA_MAX_DEVICES];
+    cudaEvent_t p2p_done_large[GGML_CUDA_MAX_DEVICES];
+    bool        p2p_small_used[P2P_SMALL_SLOTS];
+    bool        p2p_large_used;
+    uint64_t    p2p_seq;
+
+    // Fused GPU-barrier P2P path: uncached ping-pong staging + signal blocks.
+    bool                        enable_fused;
+    bool                        fused_ready;
+    bool                        fused_used;
+    size_t                      fused_max_bytes;
+    int                         fused_max_blocks;
+    ggml_cuda_ar_fused_signal * fused_sig[GGML_CUDA_MAX_DEVICES];
+    uint8_t *                   fused_stage[GGML_CUDA_MAX_DEVICES];
+
+    // Atomic dispatch telemetry (F1d verification).
+    enum stat_id {
+        STAT_HOST_CHUNKED    = 0,
+        STAT_HOST_COPY       = 1,
+        STAT_P2P_EVENT       = 2,
+        STAT_FUSED_DIRECT    = 3,
+        STAT_FUSED_TG_LAUNCH = 4,
+        STAT_WIRE_BF16       = 5,
+        STAT_WIRE_F32        = 6,
+        STAT_WIRE_F16        = 7,
+        STAT_WIRE_NAT_BF16   = 8,
+        STAT_P2P_INELIGIBLE  = 9,
+        STAT_COUNT           = 10,
+    };
+    mutable std::atomic<uint64_t> stats[STAT_COUNT];
 };
 
 // Base pointer for the (slot, rank) per-block token block.  The kernel adds
@@ -343,6 +647,14 @@ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot,
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
+}
+
+static bool ggml_cuda_ar_env_bool(const char * name, bool default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0;
 }
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -532,9 +844,129 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    const bool want_tg_env = ggml_cuda_ar_env_bool("GGML_HIP_AR_TG", false);
+    p->enable_p2p   = ggml_cuda_ar_env_bool("GGML_HIP_AR_P2P", want_tg_env);
+    p->enable_fused = ggml_cuda_ar_env_bool("GGML_HIP_AR_FUSED", want_tg_env);
+    p->p2p_ready    = false;
+    p->fused_ready  = false;
+    p->fused_used   = false;
+
+    const uint64_t req_fused_bytes = ggml_cuda_ar_env_u64("GGML_HIP_AR_FUSED_MAX_BYTES", GGML_CUDA_AR_FUSED_HALF_BYTES);
+    p->fused_max_bytes = (size_t) std::min<uint64_t>(std::max<uint64_t>(req_fused_bytes, 16u), GGML_CUDA_AR_FUSED_HALF_BYTES);
+    const uint64_t req_fused_blocks = ggml_cuda_ar_env_u64("GGML_HIP_AR_FUSED_MAX_BLOCKS", 16);
+    p->fused_max_blocks = (int) std::min<uint64_t>(std::max<uint64_t>(req_fused_blocks, 1u), GGML_CUDA_AR_FUSED_MAX_BLOCKS);
+
+    bool peer_ok = false;
+    if ((p->enable_p2p || p->enable_fused) && n_devices == 2) {
+        int can01 = 0, can10 = 0;
+        cudaError_t pc0 = cudaDeviceCanAccessPeer(&can01, p->devices[0], p->devices[1]);
+        cudaError_t pc1 = cudaDeviceCanAccessPeer(&can10, p->devices[1], p->devices[0]);
+        if (pc0 == cudaSuccess && pc1 == cudaSuccess && can01 && can10) {
+            peer_ok = true;
+            for (int i = 0; i < 2; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                cudaError_t pe = cudaDeviceEnablePeerAccess(p->devices[1 - i], 0);
+                if (pe == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void) cudaGetLastError();
+                } else if (pe != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    peer_ok = false;
+                    break;
+                }
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+        if (peer_ok) {
+            if (p->enable_p2p) {
+                const size_t small_total = (size_t) ggml_cuda_ar_pipeline::P2P_SMALL_SLOTS * ggml_cuda_ar_pipeline::P2P_SMALL_BYTES;
+                bool alloc_ok = true;
+                for (int i = 0; i < 2 && alloc_ok; ++i) {
+                    ggml_cuda_set_device(p->devices[i]);
+                    if (cudaMalloc(reinterpret_cast<void **>(&p->p2p_small_buf[i]), small_total) != cudaSuccess ||
+                        cudaMalloc(reinterpret_cast<void **>(&p->p2p_large_buf[i]), ggml_cuda_ar_pipeline::P2P_LARGE_BYTES) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        alloc_ok = false;
+                        break;
+                    }
+                    for (int s = 0; s < ggml_cuda_ar_pipeline::P2P_SMALL_SLOTS && alloc_ok; ++s) {
+                        if (cudaEventCreateWithFlags(&p->p2p_staged[i][s], cudaEventDisableTiming) != cudaSuccess ||
+                            cudaEventCreateWithFlags(&p->p2p_done[i][s],   cudaEventDisableTiming) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            alloc_ok = false;
+                        }
+                    }
+                    if (alloc_ok &&
+                        (cudaEventCreateWithFlags(&p->p2p_staged_large[i], cudaEventDisableTiming) != cudaSuccess ||
+                         cudaEventCreateWithFlags(&p->p2p_done_large[i],   cudaEventDisableTiming) != cudaSuccess)) {
+                        (void) cudaGetLastError();
+                        alloc_ok = false;
+                    }
+                }
+                if (alloc_ok) {
+                    p->p2p_ready = true;
+                } else {
+                    GGML_LOG_WARN("%s: P2P allocation failed; disabling P2P direct-write\n", __func__);
+                    for (int i = 0; i < 2; ++i) {
+                        ggml_cuda_set_device(p->devices[i]);
+                        if (p->p2p_small_buf[i]) { (void) cudaFree(p->p2p_small_buf[i]); p->p2p_small_buf[i] = nullptr; }
+                        if (p->p2p_large_buf[i]) { (void) cudaFree(p->p2p_large_buf[i]); p->p2p_large_buf[i] = nullptr; }
+                        for (int s = 0; s < ggml_cuda_ar_pipeline::P2P_SMALL_SLOTS; ++s) {
+                            if (p->p2p_staged[i][s]) { (void) cudaEventDestroy(p->p2p_staged[i][s]); p->p2p_staged[i][s] = nullptr; }
+                            if (p->p2p_done[i][s])   { (void) cudaEventDestroy(p->p2p_done[i][s]);   p->p2p_done[i][s]   = nullptr; }
+                        }
+                        if (p->p2p_staged_large[i]) { (void) cudaEventDestroy(p->p2p_staged_large[i]); p->p2p_staged_large[i] = nullptr; }
+                        if (p->p2p_done_large[i])   { (void) cudaEventDestroy(p->p2p_done_large[i]);   p->p2p_done_large[i]   = nullptr; }
+                    }
+                }
+            }
+            if (p->enable_fused) {
+                bool fused_ok = true;
+                for (int i = 0; i < 2 && fused_ok; ++i) {
+                    ggml_cuda_set_device(p->devices[i]);
+#if defined(GGML_USE_HIP)
+                    if (hipExtMallocWithFlags(reinterpret_cast<void **>(&p->fused_sig[i]), sizeof(ggml_cuda_ar_fused_signal), hipDeviceMallocUncached) != hipSuccess ||
+                        hipMemset(p->fused_sig[i], 0, sizeof(ggml_cuda_ar_fused_signal)) != hipSuccess ||
+                        hipExtMallocWithFlags(reinterpret_cast<void **>(&p->fused_stage[i]), 2 * GGML_CUDA_AR_FUSED_HALF_BYTES, hipDeviceMallocUncached) != hipSuccess ||
+                        hipMemset(p->fused_stage[i], 0, 2 * GGML_CUDA_AR_FUSED_HALF_BYTES) != hipSuccess ||
+                        hipDeviceSynchronize() != hipSuccess) {
+                        (void) hipGetLastError();
+                        fused_ok = false;
+                        break;
+                    }
+#else
+                    if (cudaMalloc(reinterpret_cast<void **>(&p->fused_sig[i]), sizeof(ggml_cuda_ar_fused_signal)) != cudaSuccess ||
+                        cudaMemset(p->fused_sig[i], 0, sizeof(ggml_cuda_ar_fused_signal)) != cudaSuccess ||
+                        cudaMalloc(reinterpret_cast<void **>(&p->fused_stage[i]), 2 * GGML_CUDA_AR_FUSED_HALF_BYTES) != cudaSuccess ||
+                        cudaMemset(p->fused_stage[i], 0, 2 * GGML_CUDA_AR_FUSED_HALF_BYTES) != cudaSuccess ||
+                        cudaDeviceSynchronize() != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        fused_ok = false;
+                        break;
+                    }
+#endif
+                }
+                if (fused_ok) {
+                    p->fused_ready = true;
+                } else {
+                    GGML_LOG_WARN("%s: fused uncached allocation failed; disabling fused GPU-barrier AR\n", __func__);
+                    for (int i = 0; i < 2; ++i) {
+                        ggml_cuda_set_device(p->devices[i]);
+                        if (p->fused_stage[i]) { (void) cudaFree(p->fused_stage[i]); p->fused_stage[i] = nullptr; }
+                        if (p->fused_sig[i])   { (void) cudaFree(p->fused_sig[i]);   p->fused_sig[i]   = nullptr; }
+                    }
+                }
+            }
+        } else {
+            GGML_LOG_WARN("%s: P2P peer access unavailable/failed; disabling P2P & fused transports\n", __func__);
+        }
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
+                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, "
+                  "p2p_ready=%d, fused_ready=%d (max_bytes=%zu, max_blocks=%d)\n",
+                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20,
+                  (int) p->p2p_ready, (int) p->fused_ready, p->fused_max_bytes, p->fused_max_blocks);
 
     return p;
 }
@@ -546,8 +978,10 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 
     // Drain all in-flight kernels before tearing down resources.
     for (int i = 0; i < p->n_devices; ++i) {
-        if (p->streams[i]) {
-            ggml_cuda_set_device(p->devices[i]);
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->p2p_ready || p->fused_used) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+        } else if (p->streams[i]) {
             CUDA_CHECK(cudaStreamSynchronize(p->streams[i]));
         }
     }
@@ -580,6 +1014,19 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             CUDA_CHECK(cudaStreamDestroy(p->streams[i]));
         }
+    }
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        if (p->fused_stage[i]) { CUDA_CHECK(cudaFree(p->fused_stage[i])); p->fused_stage[i] = nullptr; }
+        if (p->fused_sig[i])   { CUDA_CHECK(cudaFree(p->fused_sig[i]));   p->fused_sig[i]   = nullptr; }
+        if (p->p2p_small_buf[i]) { CUDA_CHECK(cudaFree(p->p2p_small_buf[i])); p->p2p_small_buf[i] = nullptr; }
+        if (p->p2p_large_buf[i]) { CUDA_CHECK(cudaFree(p->p2p_large_buf[i])); p->p2p_large_buf[i] = nullptr; }
+        for (int s = 0; s < ggml_cuda_ar_pipeline::P2P_SMALL_SLOTS; ++s) {
+            if (p->p2p_staged[i][s]) { CUDA_CHECK(cudaEventDestroy(p->p2p_staged[i][s])); p->p2p_staged[i][s] = nullptr; }
+            if (p->p2p_done[i][s])   { CUDA_CHECK(cudaEventDestroy(p->p2p_done[i][s]));   p->p2p_done[i][s]   = nullptr; }
+        }
+        if (p->p2p_staged_large[i]) { CUDA_CHECK(cudaEventDestroy(p->p2p_staged_large[i])); p->p2p_staged_large[i] = nullptr; }
+        if (p->p2p_done_large[i])   { CUDA_CHECK(cudaEventDestroy(p->p2p_done_large[i]));   p->p2p_done_large[i]   = nullptr; }
     }
     p->arrival.free();
     delete p;
@@ -745,6 +1192,299 @@ static bool ggml_cuda_ar_allreduce_copy_outer(
     return ok;
 }
 
+enum class ggml_cuda_ar_path {
+    HOST_CHUNKED,
+    HOST_COPY,
+    P2P_EVENT,
+    FUSED,
+};
+
+struct ggml_cuda_ar_policy {
+    ggml_type         input_type;
+    ggml_type         wire_type;
+    bool              use_bf16;
+    size_t            wire_type_size;
+    size_t            wire_nbytes;
+    ggml_cuda_ar_path path;
+};
+
+static ggml_cuda_ar_policy ggml_cuda_ar_select_policy(
+        const ggml_cuda_ar_pipeline * p,
+        ggml_type                     input_type,
+        int64_t                       ne,
+        size_t                        input_nbytes,
+        bool                          allow_fused) {
+    const bool use_bf16 =
+        input_type == GGML_TYPE_F32 &&
+        p->bf16_threshold > 0 &&
+        input_nbytes >= p->bf16_threshold;
+    const ggml_type wire_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
+    const size_t wire_type_size = ggml_type_size(wire_type);
+    const size_t wire_nbytes = (size_t) ne * wire_type_size;
+
+    ggml_cuda_ar_path path = ggml_cuda_ar_path::HOST_CHUNKED;
+    if (allow_fused && p->enable_fused && p->fused_ready &&
+        wire_nbytes > 0 && wire_nbytes <= p->fused_max_bytes &&
+        ((ne & 3) == 0)) {
+        path = ggml_cuda_ar_path::FUSED;
+    } else if (p->enable_p2p && p->p2p_ready) {
+        path = ggml_cuda_ar_path::P2P_EVENT;
+    } else if (p->copy_threshold > 0 && wire_nbytes >= p->copy_threshold) {
+        path = ggml_cuda_ar_path::HOST_COPY;
+    }
+    return {input_type, wire_type, use_bf16, wire_type_size, wire_nbytes, path};
+}
+
+static void ggml_cuda_ar_record_wire_stat(ggml_cuda_ar_pipeline * p, const ggml_cuda_ar_policy & pol) {
+    if (pol.use_bf16) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_WIRE_BF16].fetch_add(1, std::memory_order_relaxed);
+    } else if (pol.wire_type == GGML_TYPE_F32) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_WIRE_F32].fetch_add(1, std::memory_order_relaxed);
+    } else if (pol.wire_type == GGML_TYPE_F16) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_WIRE_F16].fetch_add(1, std::memory_order_relaxed);
+    } else if (pol.wire_type == GGML_TYPE_BF16) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_WIRE_NAT_BF16].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+template <typename T_dst, typename T_wire>
+static bool ggml_cuda_ar_p2p_event_exec(
+        ggml_cuda_ar_pipeline * p,
+        ggml_backend_t        * backends,
+        ggml_tensor           ** tensors,
+        const bool              compute_flag[GGML_CUDA_MAX_DEVICES],
+        int64_t                 ne,
+        const ggml_cuda_ar_policy & pol) {
+    const size_t input_elem_bytes = sizeof(T_dst);
+    const size_t wire_elem_bytes  = sizeof(T_wire);
+    const bool   use_small        = pol.wire_nbytes <= ggml_cuda_ar_pipeline::P2P_SMALL_BYTES;
+    const size_t max_chunk_bytes  = use_small ? ggml_cuda_ar_pipeline::P2P_SMALL_BYTES : ggml_cuda_ar_pipeline::P2P_LARGE_BYTES;
+    const int64_t max_chunk_elems = (int64_t) (max_chunk_bytes / wire_elem_bytes);
+
+    ggml_backend_cuda_context * cuda_ctx[2] = {
+        static_cast<ggml_backend_cuda_context *>(backends[0]->context),
+        static_cast<ggml_backend_cuda_context *>(backends[1]->context),
+    };
+
+    for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += max_chunk_elems) {
+        const int64_t chunk_elems = std::min(max_chunk_elems, ne - chunk_start);
+        const size_t  chunk_wire_bytes = (size_t) chunk_elems * wire_elem_bytes;
+
+        int slot = 0;
+        bool need_wait_done = false;
+        if (use_small) {
+            slot = (int) (p->p2p_seq++ % ggml_cuda_ar_pipeline::P2P_SMALL_SLOTS);
+            need_wait_done = p->p2p_small_used[slot];
+        } else {
+            need_wait_done = p->p2p_large_used;
+        }
+
+        // Phase 1: push local wire representation to peer's P2P recv buffer on compute stream.
+        for (int i = 0; i < 2; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStream_t stream = cuda_ctx[i]->stream();
+
+            if (need_wait_done) {
+                cudaEvent_t ev_done = use_small ? p->p2p_done[peer][slot] : p->p2p_done_large[peer];
+                CUDA_CHECK(cudaStreamWaitEvent(stream, ev_done, 0));
+            }
+
+            const char * src_ptr = static_cast<const char *>(tensors[i]->data) + chunk_start * (int64_t) input_elem_bytes;
+            uint8_t * peer_recv = use_small
+                ? p->p2p_small_buf[peer] + (size_t) slot * ggml_cuda_ar_pipeline::P2P_SMALL_BYTES
+                : p->p2p_large_buf[peer];
+
+            if (!pol.use_bf16 && !use_small) {
+                if (compute_flag[i]) {
+                    CUDA_CHECK(cudaMemcpyPeerAsync(
+                        peer_recv, p->devices[peer],
+                        src_ptr, p->devices[i],
+                        chunk_wire_bytes, stream));
+                } else {
+                    CUDA_CHECK(cudaMemsetAsync(peer_recv, 0, chunk_wire_bytes, stream));
+                }
+            } else {
+                const int block_size = 256;
+                int64_t work = (pol.use_bf16 && ((chunk_elems & 1) == 0)) ? (chunk_elems >> 1) : chunk_elems;
+                int n_blocks = (int) std::min<int64_t>(512, (work + block_size - 1) / block_size);
+                n_blocks = std::max(n_blocks, 1);
+                ggml_cuda_ar_p2p_write_kernel<T_dst, T_wire><<<n_blocks, block_size, 0, stream>>>(
+                    reinterpret_cast<const T_dst *>(src_ptr),
+                    reinterpret_cast<T_wire *>(peer_recv),
+                    (int) chunk_elems,
+                    compute_flag[i]);
+                CUDA_CHECK(cudaGetLastError());
+            }
+
+            cudaEvent_t ev_staged = use_small ? p->p2p_staged[i][slot] : p->p2p_staged_large[i];
+            CUDA_CHECK(cudaEventRecord(ev_staged, stream));
+        }
+
+        // Phase 2: wait for peer's staged write and perform symmetric accumulation into local tensor.
+        for (int i = 0; i < 2; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStream_t stream = cuda_ctx[i]->stream();
+
+            cudaEvent_t ev_staged_peer = use_small ? p->p2p_staged[peer][slot] : p->p2p_staged_large[peer];
+            CUDA_CHECK(cudaStreamWaitEvent(stream, ev_staged_peer, 0));
+
+            char * dst_ptr = static_cast<char *>(tensors[i]->data) + chunk_start * (int64_t) input_elem_bytes;
+            const uint8_t * self_recv = use_small
+                ? p->p2p_small_buf[i] + (size_t) slot * ggml_cuda_ar_pipeline::P2P_SMALL_BYTES
+                : p->p2p_large_buf[i];
+
+            const int block_size = 256;
+            int64_t work = (pol.use_bf16 && ((chunk_elems & 1) == 0)) ? (chunk_elems >> 1) : chunk_elems;
+            int n_blocks = (int) std::min<int64_t>(512, (work + block_size - 1) / block_size);
+            n_blocks = std::max(n_blocks, 1);
+            ggml_cuda_ar_p2p_sym_add_kernel<T_dst, T_wire><<<n_blocks, block_size, 0, stream>>>(
+                reinterpret_cast<T_dst *>(dst_ptr),
+                reinterpret_cast<const T_wire *>(self_recv),
+                (int) chunk_elems,
+                compute_flag[i]);
+            CUDA_CHECK(cudaGetLastError());
+
+            cudaEvent_t ev_done = use_small ? p->p2p_done[i][slot] : p->p2p_done_large[i];
+            CUDA_CHECK(cudaEventRecord(ev_done, stream));
+        }
+
+        if (use_small) {
+            p->p2p_small_used[slot] = true;
+        } else {
+            p->p2p_large_used = true;
+        }
+    }
+    return true;
+}
+
+bool ggml_cuda_ar_fused_prepare(
+        const ggml_cuda_ar_pipeline * p,
+        ggml_tensor                ** tensors,
+        ggml_cuda_ar_fused_plan     * plan) {
+    if (!p || !p->enable_fused || !p->fused_ready || p->n_devices != 2 || !tensors || !plan) {
+        return false;
+    }
+    if (!tensors[0] || !tensors[1]) {
+        return false;
+    }
+    const ggml_type input_type = tensors[0]->type;
+    if (input_type != GGML_TYPE_F32 && input_type != GGML_TYPE_F16 && input_type != GGML_TYPE_BF16) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        *plan = ggml_cuda_ar_fused_plan{};
+        return true;
+    }
+    if (tensors[1]->type != input_type || ggml_nelements(tensors[1]) != ne ||
+        !ggml_is_contiguously_allocated(tensors[0]) || !ggml_is_contiguously_allocated(tensors[1])) {
+        return false;
+    }
+    const size_t input_nbytes = ggml_nbytes(tensors[0]);
+    if (ggml_nbytes(tensors[1]) != input_nbytes || (input_nbytes & 0xF) != 0 ||
+        ((uintptr_t) tensors[0]->data & 0xF) != 0 || ((uintptr_t) tensors[1]->data & 0xF) != 0) {
+        return false;
+    }
+    const ggml_cuda_ar_policy pol = ggml_cuda_ar_select_policy(p, input_type, ne, input_nbytes, /*allow_fused=*/ true);
+    if (pol.path != ggml_cuda_ar_path::FUSED) {
+        return false;
+    }
+    const size_t n_q = (size_t) ne >> 2;
+    size_t b = (n_q + GGML_CUDA_AR_FUSED_THREADS - 1) / GGML_CUDA_AR_FUSED_THREADS;
+    if (b == 0) { b = 1; }
+    if (b > (size_t) p->fused_max_blocks) { b = (size_t) p->fused_max_blocks; }
+
+    plan->ne         = (size_t) ne;
+    plan->input_type = pol.input_type;
+    plan->wire_type  = pol.wire_type;
+    plan->use_bf16   = pol.use_bf16;
+    plan->blocks     = (int) b;
+    return true;
+}
+
+template <typename T_dst, typename T_wire>
+static void ggml_cuda_ar_fused_launch_typed(
+        ggml_cuda_ar_pipeline         * p,
+        int                             rank,
+        cudaStream_t                    stream,
+        ggml_tensor                   * tensor_r,
+        const ggml_cuda_ar_fused_plan * plan) {
+    const bool active = (tensor_r->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    ggml_cuda_ar_fused_kernel<T_dst, T_wire><<<plan->blocks, GGML_CUDA_AR_FUSED_THREADS, 0, stream>>>(
+        static_cast<T_dst *>(tensor_r->data),
+        plan->ne,
+        rank,
+        active,
+        p->fused_sig[rank],
+        p->fused_sig[1 - rank],
+        p->fused_stage[rank],
+        p->fused_stage[1 - rank]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_ar_fused_launch_rank(
+        ggml_cuda_ar_pipeline         * p,
+        ggml_backend_t                * backends,
+        int                             rank,
+        ggml_tensor                   * tensor_r,
+        const ggml_cuda_ar_fused_plan * plan,
+        bool                            count_as_tg) {
+    GGML_ASSERT(p && p->fused_ready && plan);
+    if (plan->ne == 0) {
+        return;
+    }
+    GGML_ASSERT(plan->blocks > 0);
+    GGML_ASSERT(rank == 0 || rank == 1);
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backends[rank]->context);
+    GGML_ASSERT(ctx->device == p->devices[rank]);
+    cudaStream_t s = ctx->stream();
+    ggml_cuda_set_device(p->devices[rank]);
+    p->fused_used = true;
+
+    if (rank == 0 && count_as_tg) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_FUSED_TG_LAUNCH].fetch_add(1, std::memory_order_relaxed);
+        const ggml_cuda_ar_policy pol = {
+            plan->input_type, plan->wire_type, plan->use_bf16,
+            ggml_type_size(plan->wire_type), plan->ne * ggml_type_size(plan->wire_type),
+            ggml_cuda_ar_path::FUSED
+        };
+        ggml_cuda_ar_record_wire_stat(p, pol);
+    }
+
+    if (plan->use_bf16) {
+        ggml_cuda_ar_fused_launch_typed<float, nv_bfloat16>(p, rank, s, tensor_r, plan);
+        return;
+    }
+    switch (plan->input_type) {
+        case GGML_TYPE_F32:  ggml_cuda_ar_fused_launch_typed<float,       float>      (p, rank, s, tensor_r, plan); break;
+        case GGML_TYPE_F16:  ggml_cuda_ar_fused_launch_typed<half,        half>       (p, rank, s, tensor_r, plan); break;
+        case GGML_TYPE_BF16: ggml_cuda_ar_fused_launch_typed<nv_bfloat16, nv_bfloat16>(p, rank, s, tensor_r, plan); break;
+        default: GGML_ASSERT(false);
+    }
+}
+
+size_t ggml_cuda_ar_get_stats(const ggml_cuda_ar_pipeline * p, uint64_t * out, size_t cap) {
+    if (!p || !out) {
+        return 0;
+    }
+    const size_t n = std::min<size_t>(cap, ggml_cuda_ar_pipeline::STAT_COUNT);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = p->stats[i].load(std::memory_order_relaxed);
+    }
+    return n;
+}
+
+void ggml_cuda_ar_reset_stats(ggml_cuda_ar_pipeline * p) {
+    if (!p) {
+        return;
+    }
+    for (size_t i = 0; i < ggml_cuda_ar_pipeline::STAT_COUNT; ++i) {
+        p->stats[i].store(0, std::memory_order_relaxed);
+    }
+}
+
 bool ggml_cuda_ar_allreduce(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
@@ -762,31 +1502,47 @@ bool ggml_cuda_ar_allreduce(
 
     const size_t   input_nbytes = ggml_nbytes(tensors[0]);
 
-    // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
-    // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
-    // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
-    // inner paths see them as already-prepared compute tensors.
-    const bool use_bf16 =
-        input_type == GGML_TYPE_F32 &&
-        p->bf16_threshold > 0 &&
-        input_nbytes >= p->bf16_threshold;
-
-    const ggml_type kernel_type = use_bf16 ? GGML_TYPE_BF16 : input_type;
-    const size_t    type_size   = ggml_type_size(kernel_type);
+    const ggml_cuda_ar_policy pol = ggml_cuda_ar_select_policy(p, input_type, ne, input_nbytes, /*allow_fused=*/ true);
+    const bool      use_bf16    = pol.use_bf16;
+    const ggml_type kernel_type = pol.wire_type;
+    const size_t    type_size   = pol.wire_type_size;
     GGML_ASSERT(p->buf_bytes >= type_size);
-    const size_t    nbytes      = (size_t) ne * type_size;
+    const size_t    nbytes      = pol.wire_nbytes;
+
+    ggml_cuda_ar_record_wire_stat(p, pol);
 
     bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
     for (int i = 0; i < n; ++i) {
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // Decide between copy-engine and chunked kernel paths based on the working
-    // type's actual byte count.  No upper bound: copy_outer slices reductions
-    // larger than copy_bytes into copy_bytes-sized pieces.
-    const bool use_copy_engine =
-        p->copy_threshold > 0 &&
-        nbytes >= p->copy_threshold;
+    if (pol.path == ggml_cuda_ar_path::FUSED) {
+        ggml_cuda_ar_fused_plan plan{};
+        if (ggml_cuda_ar_fused_prepare(p, tensors, &plan)) {
+            p->stats[ggml_cuda_ar_pipeline::STAT_FUSED_DIRECT].fetch_add(1, std::memory_order_relaxed);
+            for (int i = 0; i < 2; ++i) {
+                ggml_cuda_ar_fused_launch_rank(p, backends, i, tensors[i], &plan, /*count_as_tg=*/ false);
+            }
+            return true;
+        }
+    }
+
+    if (pol.path == ggml_cuda_ar_path::P2P_EVENT) {
+        p->stats[ggml_cuda_ar_pipeline::STAT_P2P_EVENT].fetch_add(1, std::memory_order_relaxed);
+        if (use_bf16) {
+            return ggml_cuda_ar_p2p_event_exec<float, nv_bfloat16>(p, backends, tensors, compute_flag, ne, pol);
+        }
+        switch (input_type) {
+            case GGML_TYPE_F32:  return ggml_cuda_ar_p2p_event_exec<float,       float>      (p, backends, tensors, compute_flag, ne, pol);
+            case GGML_TYPE_F16:  return ggml_cuda_ar_p2p_event_exec<half,        half>       (p, backends, tensors, compute_flag, ne, pol);
+            case GGML_TYPE_BF16: return ggml_cuda_ar_p2p_event_exec<nv_bfloat16, nv_bfloat16>(p, backends, tensors, compute_flag, ne, pol);
+            default: GGML_ASSERT(false);
+        }
+    }
+
+    const bool use_copy_engine = (pol.path == ggml_cuda_ar_path::HOST_COPY);
+    p->stats[use_copy_engine ? ggml_cuda_ar_pipeline::STAT_HOST_COPY : ggml_cuda_ar_pipeline::STAT_HOST_CHUNKED]
+        .fetch_add(1, std::memory_order_relaxed);
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
     // (chunked kernel path) and the combined add kernel (copy_engine path)
@@ -972,6 +1728,16 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
+}
+size_t ggml_cuda_ar_get_stats(const ggml_cuda_ar_pipeline *, uint64_t *, size_t) {
+    return 0;
+}
+void ggml_cuda_ar_reset_stats(ggml_cuda_ar_pipeline *) {
+}
+bool ggml_cuda_ar_fused_prepare(const ggml_cuda_ar_pipeline *, ggml_tensor **, ggml_cuda_ar_fused_plan *) {
+    return false;
+}
+void ggml_cuda_ar_fused_launch_rank(ggml_cuda_ar_pipeline *, ggml_backend_t *, int, ggml_tensor *, const ggml_cuda_ar_fused_plan *, bool) {
 }
 
 #endif // !defined(GGML_USE_MUSA)

@@ -1364,6 +1364,11 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Whole-token outer graph ownership refcount, pool invalidation epoch, and failure injection hook.
+    uint32_t outer_graph_depth      = 0;
+    uint64_t graph_epoch            = 0;
+    bool     test_fail_next_capture = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1382,6 +1387,15 @@ struct ggml_backend_cuda_context {
     // Check if any CUDA graph has an instance for this context
     bool any_cuda_graph_has_instance() const;
 #endif // USE_CUDA_GRAPH
+
+#ifdef GGML_EXP_COLA
+    // : q8_1 activations produced by the fused norm (kept until the next fused norm / end of graph)
+    void *              cola_q8_buf  = nullptr;
+    const ggml_tensor * cola_q8_src1 = nullptr;
+    int64_t             cola_q8_ne0  = 0;
+    int64_t             cola_q8_ne1  = 0;
+    void *              cola_scratch = nullptr;   // completion counter + parked results of the gates kernel
+#endif
 
     explicit ggml_backend_cuda_context(int device);
 

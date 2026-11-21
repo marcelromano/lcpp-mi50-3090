@@ -4,6 +4,17 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-b4.cuh"
+#include "fattn-p906k.cuh"
+
+// the block-b4 decode/verify kernel (fattn-vec-lc.cuh, gfx906 only) is already in this stack
+// but was reachable only through GGML_FA_B4=1. The fork calls it from the main dispatch for
+// 1..8-token batches with n_kv >= GGML_FA_LC_MIN_KV; hook it the same way. HIP-only by construction,
+// so the CUDA build is unaffected.
+#if defined(GGML_USE_HIP)
+#define GGML_EXP_FA_LC
+#endif
+#include "fattn-vec-lc.cuh"
 
 #if !defined(GGML_USE_MUSA)
 
@@ -818,13 +829,34 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+#if defined(GGML_USE_HIP)
+    if (kernel != BEST_FATTN_KERNEL_NONE &&
+            GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ctx.device].cc) &&
+            ggml_cuda_flash_attn_ext_p906k_try(ctx, dst)) {
+        return;
+    }
+#endif
+    if (kernel != BEST_FATTN_KERNEL_NONE && ggml_cuda_fattn_b4_try(ctx, dst)) {
+        return;
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+#ifdef GGML_EXP_FA_LC
+            if (ggml_cuda_flash_attn_ext_vec_lc(ctx, dst)) { // 1..8 tokens: replaces tile + f16 conversion of the whole KV
+                break;
+            }
+#endif
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+#ifdef GGML_EXP_FA_LC
+            if (ggml_cuda_flash_attn_ext_vec_lc(ctx, dst)) {
+                break;
+            }
+#endif
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
