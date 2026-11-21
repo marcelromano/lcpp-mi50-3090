@@ -3357,6 +3357,138 @@ void common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_
     for (auto & impl : spec->impls) impl->clear_state(seq_id);
 }
 
+// warm the graph cache with the decode/verify shapes of a typical request. The KV window is
+// what makes this different from a plain empty run: the graph keys carry the attention window, so the
+// capture only covers real decodes when the dummy prompt reaches the window of the served requests.
+bool common_speculative_warmup(
+        common_speculative * spec,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        int n_prefill,
+        int n_steps) {
+    if (spec == nullptr || ctx_tgt == nullptr || n_prefill <= 0 || n_steps <= 0) {
+        return false;
+    }
+
+    const llama_model * model = llama_get_model(ctx_tgt);
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    if (n_vocab < 1024) {
+        return false;
+    }
+
+    // greedy chain, the shape a temperature-0 request uses for its backend sampling
+    common_params_sampling sparams;
+    sparams.temp  = 0.0f;
+    sparams.top_k = 1;
+    sparams.top_p = 1.0f;
+    sparams.min_p = 0.0f;
+    sparams.seed  = 1234;
+
+    common_sampler_ptr smpl(common_sampler_init(model, sparams));
+    if (!smpl) {
+        return false;
+    }
+    const bool tgt_backend_smpl = llama_set_sampler(ctx_tgt, seq_id, common_sampler_get(smpl.get()));
+
+    llama_tokens prompt;
+    prompt.reserve((size_t) n_prefill + 4 * (size_t) n_steps);
+    for (int i = 0; i < n_prefill; ++i) {
+        prompt.push_back((llama_token) (1 + (i * 7) % (n_vocab - 1)));
+    }
+
+    auto make_batch = [&](const llama_tokens & toks, llama_pos pos0, bool all_output) {
+        common_batch batch(ctx_tgt);
+        for (size_t i = 0; i < toks.size(); ++i) {
+            const bool output = all_output || i + 1 == toks.size();
+            batch.add(toks[i], pos0 + (llama_pos) i, seq_id, output);
+        }
+        return batch;
+    };
+
+    bool ok = true;
+
+    // short prefill on the target, the draft context is advanced by process() as after every server decode
+    {
+        auto batch = make_batch(prompt, 0, false);
+        ok = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    }
+
+    if (ok) {
+        auto batch = make_batch(prompt, 0, false);
+        ok = common_speculative_process(spec, batch);
+    }
+    if (ok) {
+        common_speculative_begin(spec, seq_id, prompt);
+    }
+
+    llama_tokens draft;
+    for (int step = 0; ok && step < n_steps; ++step) {
+        auto & dp = common_speculative_get_draft_params(spec, seq_id);
+        dp.drafting = true;
+        dp.n_max    = common_speculative_n_max(spec);
+        dp.pos0     = (llama_pos) prompt.size();
+        dp.id_last  = prompt.back();
+        dp.prompt   = &prompt;
+        dp.result   = &draft;
+        dp.result_q = nullptr;
+        dp.temp     = 0.0f;
+        dp.seed     = 1234;
+
+        draft.clear();
+        common_speculative_draft(spec);
+
+        llama_tokens verify;
+        verify.reserve(1 + draft.size());
+        verify.push_back(dp.id_last);
+        verify.insert(verify.end(), draft.begin(), draft.end());
+
+        const llama_pos pos0 = (llama_pos) prompt.size();
+
+        // the drafts left their own KV in the draft region: drop it, the catch-up rebuilds those
+        // positions from the target rows (same as the server does before the next target decode)
+        if (ctx_dft != nullptr) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos0, -1);
+        }
+
+        auto batch = make_batch(verify, pos0, true);
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            ok = false;
+            break;
+        }
+
+        // same as the server: the catch-up runs after the target verify, then the drafts are accepted
+        auto cbatch = make_batch(verify, pos0, true);
+        if (!common_speculative_process(spec, cbatch)) {
+            ok = false;
+            break;
+        }
+        common_speculative_accept(spec, seq_id, (uint16_t) draft.size());
+
+        prompt.insert(prompt.end(), verify.begin(), verify.end());
+    }
+
+    // remove only the dummy positions: llama_memory_clear would drop exactly the graphs just captured
+    llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, 0, -1);
+    if (ctx_dft != nullptr) {
+        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, 0, -1);
+    }
+    common_speculative_clear_state(spec, seq_id);
+
+    if (tgt_backend_smpl) {
+        llama_set_sampler(ctx_tgt, seq_id, nullptr);
+    }
+
+    llama_synchronize(ctx_tgt);
+    llama_perf_context_reset(ctx_tgt);
+    if (ctx_dft != nullptr) {
+        llama_synchronize(ctx_dft);
+        llama_perf_context_reset(ctx_dft);
+    }
+
+    return ok;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;

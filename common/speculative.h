@@ -51,6 +51,20 @@ bool common_speculative_are_compatible(const llama_model * model_tgt, const llam
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
+// capture the graph-cache slots that the decode/verify of a typical request uses, before the
+// server starts serving: a short prefill followed by a few MTP steps (draft -> verify -> catch-up) at
+// the same KV window, with the dummy positions removed with seq_rm at the end (slots, KV and outputs
+// are left untouched). Must be called after common_speculative_init(), which registers the backend
+// sampler chains and the nextn device buffers used by the draft context.
+// Returns false when the warm-up could not run (no speculative context, unsupported context, error).
+bool common_speculative_warmup(
+        common_speculative * spec,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        int n_prefill,
+        int n_steps);
+
 void common_speculative_free(common_speculative * spec);
 
 struct common_speculative_draft_params {

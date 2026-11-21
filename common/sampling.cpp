@@ -8,6 +8,12 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -127,6 +133,13 @@ struct common_sampler {
     // Stateless device prefix only; all CPU transforms and the seeded RNG stay
     // on the original chain and run only for rows actually visited by verify.
     llama_sampler * device_topk = nullptr;
+
+    // exact host top-k prefilter plan (lazy; -2 = not computed, -1 = not applicable)
+    int fast_topk_pos = -2;
+    int fast_topk_k   = 0;
+    std::vector<std::pair<llama_token, float>> fast_bias; // merged logit-bias list, stably sorted by token
+    std::vector<std::pair<llama_token, float>> fast_biased; // scratch: final biased values
+    std::vector<float> fast_top;                            // scratch: k-slot threshold array
 
     void reset() {
         prev.clear();
@@ -551,6 +564,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
+    dst->fast_topk_pos = -2; // params may differ, recompute the plan
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -650,6 +664,283 @@ struct llama_sampler * common_sampler_get_device_topk(struct common_sampler * gs
     return gsmpl->device_topk;
 }
 
+// exact host top-k prefilter.
+//
+// When the chain is [no-op samplers | logit-bias]* -> top-k(k <= 128) -> ..., the full-vocabulary
+// fill of cur_p plus std::partial_sort is replaced by two streaming passes over the raw logits
+// row that yield the same k candidates in the same order. The fast path is taken only when the
+// result is provably identical: no NaN, exactly k values >= the k-th largest one (no boundary
+// tie) and the k values strictly decreasing (so the partial_sort order is unique). Otherwise it
+// falls back to the original path. The samplers after top-k run unchanged on the k candidates,
+// exactly as they would after the original top-k truncated cur_p to k entries.
+// LLAMA_HOST_TOPK_FAST=0 disables it.
+static bool t2049_fast_topk_enabled() {
+    static const bool enabled = [] {
+        const char * e = std::getenv("LLAMA_HOST_TOPK_FAST");
+        return !(e && *e && std::strcmp(e, "0") == 0);
+    }();
+    return enabled;
+}
+
+static void t2049_fast_topk_plan(struct common_sampler * gsmpl, const llama_vocab * vocab, int n_vocab) {
+    gsmpl->fast_topk_pos = -1;
+    if (!t2049_fast_topk_enabled() || gsmpl->grmr || gsmpl->rbudget || gsmpl->params.backend_sampling) {
+        return;
+    }
+    const int k = gsmpl->params.top_k;
+    if (k <= 0 || k > 128 || k >= n_vocab) {
+        return;
+    }
+    int n_bias_smpl = 0;
+    int pos = -1;
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    for (int j = 0; j < n; ++j) {
+        const char * name = llama_sampler_name(llama_sampler_chain_get(gsmpl->chain, j));
+        if (name && name[0] == '?') {
+            continue; // empty (no-op) sampler
+        }
+        if (name && std::strcmp(name, "logit-bias") == 0) {
+            ++n_bias_smpl;
+            continue;
+        }
+        if (name && std::strcmp(name, "top-k") == 0) {
+            pos = j;
+        }
+        break;
+    }
+    if (pos < 0 || n_bias_smpl > 1) {
+        return;
+    }
+    // rebuild the merged list exactly as common_sampler_init() does (user biases + suppress tokens)
+    std::vector<std::pair<llama_token, float>> bias;
+    for (const auto & lb : gsmpl->params.logit_bias) {
+        bias.emplace_back(lb.token, lb.bias);
+    }
+    int32_t n_suppress = 0;
+    const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    for (int32_t i = 0; i < n_suppress; ++i) {
+        bias.emplace_back(suppress[i], -INFINITY);
+    }
+    if ((n_bias_smpl == 1) != !bias.empty()) {
+        return; // the chain does not match our reconstruction
+    }
+    for (const auto & b : bias) {
+        if (b.first < 0 || b.first >= n_vocab) {
+            return; // the original would search the shuffled array; keep it on the original path
+        }
+    }
+    std::stable_sort(bias.begin(), bias.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+    gsmpl->fast_bias   = std::move(bias);
+    gsmpl->fast_topk_k = k;
+    gsmpl->fast_topk_pos = pos;
+}
+
+// max of x[0..n) and NaN flag (exact: max is order independent without NaN)
+static inline float t2049_blk_max(const float * x, int n, bool & nan) {
+    int i = 0;
+    float m = -INFINITY;
+#if defined(__SSE2__)
+    __m128 m0 = _mm_set1_ps(-INFINITY), m1 = m0, m2 = m0, m3 = m0, u = _mm_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        const __m128 a = _mm_loadu_ps(x + i);
+        const __m128 b = _mm_loadu_ps(x + i + 4);
+        const __m128 c = _mm_loadu_ps(x + i + 8);
+        const __m128 d = _mm_loadu_ps(x + i + 12);
+        u  = _mm_or_ps(u, _mm_or_ps(_mm_or_ps(_mm_cmpunord_ps(a, a), _mm_cmpunord_ps(b, b)),
+                                    _mm_or_ps(_mm_cmpunord_ps(c, c), _mm_cmpunord_ps(d, d))));
+        m0 = _mm_max_ps(m0, a);
+        m1 = _mm_max_ps(m1, b);
+        m2 = _mm_max_ps(m2, c);
+        m3 = _mm_max_ps(m3, d);
+    }
+    m0 = _mm_max_ps(_mm_max_ps(m0, m1), _mm_max_ps(m2, m3));
+    float t4[4];
+    _mm_storeu_ps(t4, m0);
+    nan |= _mm_movemask_ps(u) != 0;
+    m = std::max(std::max(t4[0], t4[1]), std::max(t4[2], t4[3]));
+#endif
+    for (; i < n; ++i) {
+        const float v = x[i];
+        nan |= v != v;
+        m = v > m ? v : m;
+    }
+    return m;
+}
+
+enum t2049_reason { T49_FAST = 0, T49_NAN, T49_NOTHR, T49_TIE_EDGE, T49_TIE_IN, T49_N };
+static std::atomic<uint64_t> t2049_cnt[T49_N];
+
+// fills gsmpl->cur with the top-k candidates (sorted, strictly decreasing); false -> use the original path
+static bool t2049_fast_topk_fill(struct common_sampler * gsmpl, const float * logits, int n_vocab) {
+    const int k = gsmpl->fast_topk_k;
+
+    // biased tokens: final values in the original apply order (logit += bias, sequentially).
+    // fast_bias_order is the merged list stably sorted by token, so duplicates keep their order.
+    auto & biased = gsmpl->fast_biased;
+    biased.clear();
+    for (const auto & b : gsmpl->fast_bias) {
+        if (!biased.empty() && biased.back().first == b.first) {
+            biased.back().second += b.second;
+        } else {
+            biased.emplace_back(b.first, logits[b.first] + b.second);
+        }
+    }
+
+    constexpr int B = 256;
+    auto & top = gsmpl->fast_top;
+    top.assign(k, -INFINITY);
+    bool nan = false;
+
+    // pass 1: k-th largest value; blocks whose max cannot enter are skipped
+    size_t ib = 0;
+    for (int b0 = 0; b0 < n_vocab; b0 += B) {
+        const int b1 = std::min(n_vocab, b0 + B);
+        const bool has_bias = ib < biased.size() && biased[ib].first < b1;
+        if (!has_bias) {
+            const float m = t2049_blk_max(logits + b0, b1 - b0, nan);
+            if (!(m > top[0])) {
+                continue;
+            }
+        }
+        for (int i = b0; i < b1; ++i) {
+            float v = logits[i];
+            if (ib < biased.size() && biased[ib].first == i) {
+                v = biased[ib++].second;
+            }
+            nan |= v != v;
+            if (v > top[0]) {
+                int j = 0;
+                while (j + 1 < k && top[j + 1] < v) {
+                    top[j] = top[j + 1];
+                    ++j;
+                }
+                top[j] = v;
+            }
+        }
+    }
+    const float thr = top[0];
+    if (nan) {
+        t2049_cnt[T49_NAN]++;
+        return false;
+    }
+    if (!(thr > -INFINITY)) {
+        t2049_cnt[T49_NOTHR]++;
+        return false;
+    }
+
+    // pass 2: gather every candidate >= threshold, in vocabulary order
+    auto & cur = gsmpl->cur;
+    cur.clear();
+    ib = 0;
+    bool dummy = false;
+    for (int b0 = 0; b0 < n_vocab; b0 += B) {
+        const int b1 = std::min(n_vocab, b0 + B);
+        const bool has_bias = ib < biased.size() && biased[ib].first < b1;
+        if (!has_bias && !(t2049_blk_max(logits + b0, b1 - b0, dummy) >= thr)) {
+            continue;
+        }
+        for (int i = b0; i < b1; ++i) {
+            float v = logits[i];
+            if (ib < biased.size() && biased[ib].first == i) {
+                v = biased[ib++].second;
+            }
+            if (v >= thr) {
+                if ((int) cur.size() == k) {
+                    t2049_cnt[T49_TIE_EDGE]++;
+                    return false; // boundary tie: more than k candidates
+                }
+                cur.push_back(llama_token_data{ (llama_token) i, v, 0.0f });
+            }
+        }
+    }
+    if ((int) cur.size() != k) {
+        t2049_cnt[T49_TIE_EDGE]++;
+        return false;
+    }
+    std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+        return a.logit > b.logit;
+    });
+    for (int i = 1; i < k; ++i) {
+        if (!(cur[i - 1].logit > cur[i].logit)) {
+            t2049_cnt[T49_TIE_IN]++;
+            return false; // tie inside the top-k: the partial_sort order is not unique
+        }
+    }
+    gsmpl->cur_p = { cur.data(), cur.size(), -1, true };
+    t2049_cnt[T49_FAST]++;
+    return true;
+}
+
+static bool t2049_fast_topk_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, llama_token & id) {
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    if (gsmpl->fast_topk_pos == -2) {
+        t2049_fast_topk_plan(gsmpl, vocab, n_vocab);
+    }
+    if (gsmpl->fast_topk_pos < 0) {
+        return false;
+    }
+    // backend-sampled rows keep the original path
+    if (llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL ||
+        llama_get_sampled_probs_ith(ctx, idx) || llama_get_sampled_logits_ith(ctx, idx)) {
+        return false;
+    }
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (!logits) {
+        return false;
+    }
+
+    static const bool stats = std::getenv("LLAMA_HOST_TOPK_STATS") != nullptr;
+    static std::atomic<uint64_t> n_calls{0};
+
+    const bool ok = t2049_fast_topk_fill(gsmpl, logits, n_vocab);
+    if (stats && ((++n_calls) % 256) == 0) {
+        fprintf(stderr, "t2049 host-topk fast=%llu nan=%llu nothr=%llu tie_edge=%llu tie_in=%llu k=%d nbias=%zu\n",
+                (unsigned long long) t2049_cnt[T49_FAST].load(), (unsigned long long) t2049_cnt[T49_NAN].load(),
+                (unsigned long long) t2049_cnt[T49_NOTHR].load(), (unsigned long long) t2049_cnt[T49_TIE_EDGE].load(),
+                (unsigned long long) t2049_cnt[T49_TIE_IN].load(), gsmpl->fast_topk_k, gsmpl->fast_bias.size());
+    }
+    if (!ok) {
+        return false;
+    }
+    static const bool verify = std::getenv("LLAMA_HOST_TOPK_VERIFY") != nullptr;
+    const int n = llama_sampler_chain_n(gsmpl->chain);
+    if (verify) {
+        // self-check: the original fill + chain prefix (bias .. top-k) on the full vocabulary
+        std::vector<llama_token_data> full(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            full[i] = llama_token_data{ (llama_token) i, logits[i], 0.0f };
+        }
+        llama_token_data_array fa = { full.data(), full.size(), -1, false };
+        for (int j = 0; j <= gsmpl->fast_topk_pos; ++j) {
+            llama_sampler_apply(llama_sampler_chain_get(gsmpl->chain, j), &fa);
+        }
+        bool same = fa.size == gsmpl->cur_p.size && fa.sorted;
+        for (size_t i = 0; same && i < fa.size; ++i) {
+            same = fa.data[i].id == gsmpl->cur_p.data[i].id && fa.data[i].logit == gsmpl->cur_p.data[i].logit &&
+                   fa.data[i].p == gsmpl->cur_p.data[i].p;
+        }
+        static std::atomic<uint64_t> n_ok{0}, n_bad{0};
+        if (same) {
+            n_ok++;
+        } else {
+            n_bad++;
+        }
+        if (!same || ((n_ok.load() % 256) == 0)) {
+            fprintf(stderr, "t2049 host-topk verify ok=%llu bad=%llu k=%d\n",
+                    (unsigned long long) n_ok.load(), (unsigned long long) n_bad.load(), gsmpl->fast_topk_k);
+        }
+    }
+    // the samplers after top-k, exactly as the chain would run them on the truncated array
+    for (int j = gsmpl->fast_topk_pos + 1; j < n; ++j) {
+        llama_sampler_apply(llama_sampler_chain_get(gsmpl->chain, j), &gsmpl->cur_p);
+    }
+    GGML_ASSERT(gsmpl->cur_p.selected >= 0 && gsmpl->cur_p.selected < (int64_t) gsmpl->cur_p.size);
+    id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -657,6 +948,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
+
+    if (t2049_fast_topk_sample(gsmpl, ctx, idx, id)) {
+        return id;
+    }
 
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;

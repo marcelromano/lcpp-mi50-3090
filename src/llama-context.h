@@ -379,6 +379,8 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+    void               gf_cache_clear();
+    void               gf_cache_reset_results();
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -542,8 +544,21 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Active graph result plus cached (graph, sched) slots sharing the scheduler's compute vbuffers.
+    struct gf_cache_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+        uint64_t buf_epoch = 0;
+        uint64_t last_used = 0;
+        uint32_t n_tokens  = 0;
+    };
+    llm_graph_result_ptr gf_res_active;
+    uint64_t active_buf_epoch = 0;
+    uint64_t gf_cache_tick    = 0;
+    uint32_t active_n_tokens  = 0;
+    ggml_backend_t       pending_state_wait_backend = nullptr;
+    ggml_backend_event_t pending_state_wait_event   = nullptr;
+    std::vector<gf_cache_slot> gf_cache;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
