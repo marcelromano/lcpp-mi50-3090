@@ -180,6 +180,20 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+# run manually with -m <synthetic hybrid gguf> (gen_synth_hybrid.py)
+llama_build(test-hybrid-state.cpp)
+llama_build(test-device-checkpoint.cpp)
+llama_build(test-checkpoint-plan.cpp)
+llama_build(test-ckpt-roundtrip.cpp)
+set(LLAMA_B2_TEST_ATTN_MODEL "" CACHE FILEPATH "Synthetic attention fixture for block-2 model-dependent tests")
+llama_build_and_test(test-kv-admission-components.cpp ../tools/server/kv_planner.cpp)
+llama_build_and_test(test-kv-admission-restore-plan.cpp ../tools/server/kv_planner.cpp)
+llama_build_and_test(test-kv-admission-restore-bridge.cpp ../tools/server/kv_planner.cpp)
+target_include_directories(test-kv-admission-restore-bridge PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-kv-admission-two-contexts.cpp ../tools/server/kv_planner.cpp)
+if (LLAMA_B2_TEST_ATTN_MODEL)
+    add_test(NAME test-kv-admission-two-contexts COMMAND test-kv-admission-two-contexts ${LLAMA_B2_TEST_ATTN_MODEL})
+endif()
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -433,6 +447,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp  LABEL "behavior backend"  LINK ggml)
+    llama_build_and_test(test-meta-allreduce.cpp  LABEL "behavior backend"  LINK ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
@@ -440,3 +455,20 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+llama_build(test-memory-resource-capacity.cpp)
+llama_build(test-recurrent-resource-capacity.cpp)
+target_include_directories(test-recurrent-resource-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build(test-memory-resource-composition.cpp)
+target_include_directories(test-memory-resource-composition PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)
+
+llama_build(test-kv-admission-bounded-reader.cpp)
+llama_build(test-kv-admission-r4-r5.cpp ../tools/server/kv_planner.cpp)
+if (LLAMA_B2_TEST_ATTN_MODEL)
+    add_test(NAME test-kv-admission-bounded-reader COMMAND test-kv-admission-bounded-reader ${LLAMA_B2_TEST_ATTN_MODEL} ${CMAKE_BINARY_DIR})
+    add_test(NAME test-kv-admission-r4-r5 COMMAND test-kv-admission-r4-r5 ${LLAMA_B2_TEST_ATTN_MODEL} ${CMAKE_BINARY_DIR})
+endif()
+
+
+llama_build_and_test(test-kv-admission-recurrent-reader.cpp)
+target_include_directories(test-kv-admission-recurrent-reader PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/ggml/src)

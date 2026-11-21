@@ -16,6 +16,8 @@ add_library(${TARGET} STATIC
     server-decision.cpp
     server-decision.h
     server-context.cpp
+    kv_planner.cpp
+    kv_planner.hpp
     server-context.h
     server-realtime.cpp
     server-realtime.h
@@ -73,3 +75,5 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# Block-2 integration tests exercise the public HTTP contract; no alternate test dispatcher.
