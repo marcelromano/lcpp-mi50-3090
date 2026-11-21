@@ -351,6 +351,10 @@ extern "C" {
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+    GGML_API ggml_backend_sched_t ggml_backend_sched_clone_shared(ggml_backend_sched_t src);
+    GGML_API uint64_t             ggml_backend_sched_get_buffer_epoch(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_is_alloc(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_rebind_alloc(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
@@ -444,6 +448,20 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+#define GGML_META_HAS_TG_STATS 1
+    GGML_API size_t ggml_backend_meta_tg_get_stats(ggml_backend_t meta_backend, uint64_t * out, size_t cap);
+
+    // decomposição física de um intervalo de um tensor dividido (save do checkpoint device)
+    GGML_API size_t                     ggml_backend_meta_buft_n_simple   (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buft_simple     (ggml_backend_buffer_type_t buft, size_t index);
+    GGML_API size_t                     ggml_backend_meta_tensor_n_simple (const struct ggml_tensor * tensor);
+    GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+    GGML_API bool           ggml_backend_is_meta              (ggml_backend_t backend);
+    GGML_API ggml_backend_t ggml_backend_meta_simple_backend (ggml_backend_t meta_backend, size_t index);
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+    GGML_API struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor);
 
     //
     // Utils

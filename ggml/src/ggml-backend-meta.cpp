@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -115,6 +116,11 @@ static enum ggml_backend_dev_type ggml_backend_meta_device_get_type(ggml_backend
     GGML_UNUSED(dev);
 }
 
+static bool ggml_backend_meta_events_enabled() {
+    const char * value=getenv("GGML_META_EVENTS");
+    return value && atoi(value)!=0;
+}
+
 static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
@@ -131,7 +137,7 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         /* .async                 = */ true,
         /* .host_buffer           = */ false, // Not implemented.
         /* .buffer_from_host_ptr  = */ false, // Not implemented.
-        /* .events                = */ false, // Not implemented.
+        /* .events                = */ ggml_backend_meta_events_enabled(),
         /* .mmap_support          = */ true,
     };
     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
@@ -140,7 +146,8 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         props->caps.async                = props->caps.async                && tmp_props.caps.async;
         props->caps.host_buffer          = props->caps.host_buffer          && tmp_props.caps.host_buffer;
         props->caps.buffer_from_host_ptr = props->caps.buffer_from_host_ptr && tmp_props.caps.buffer_from_host_ptr;
-        props->caps.events               = props->caps.events               && tmp_props.caps.events;
+        props->caps.events               = props->caps.events               && tmp_props.caps.events &&
+            ggml_backend_dev_backend_reg(simple_dev)==ggml_backend_dev_backend_reg(meta_dev_ctx->simple_devs.front());
         props->caps.mmap_support         = props->caps.mmap_support         && tmp_props.caps.mmap_support;
     }
 }
@@ -177,6 +184,33 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
     return true;
 }
 
+struct ggml_backend_meta_event_context {
+    std::vector<ggml_backend_event_t> events;
+    ~ggml_backend_meta_event_context() { for(auto * e:events) ggml_backend_event_free(e); }
+};
+
+static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_dev_props props;
+    ggml_backend_meta_device_get_props(dev,&props);
+    if(!props.caps.events) return nullptr;
+    const auto * dc=(const ggml_backend_meta_device_context *)dev->context;
+    auto ec=std::make_unique<ggml_backend_meta_event_context>();
+    for(auto * simple_dev:dc->simple_devs) {
+        auto * e=ggml_backend_event_new(simple_dev);
+        if(!e) return nullptr;
+        ec->events.push_back(e);
+    }
+    return new ggml_backend_event{dev,ec.release()};
+}
+static void ggml_backend_meta_device_event_free(ggml_backend_dev_t,ggml_backend_event_t event) {
+    delete (ggml_backend_meta_event_context *)event->context;
+    delete event;
+}
+static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t,ggml_backend_event_t event) {
+    const auto * ec=(const ggml_backend_meta_event_context *)event->context;
+    for(auto * e:ec->events) ggml_backend_event_synchronize(e);
+}
+
 static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .get_name             = */ ggml_backend_meta_device_get_name,
     /* .get_description      = */ ggml_backend_meta_device_get_description,
@@ -190,9 +224,9 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
     /* .offload_op           = */ nullptr,
-    /* .event_new            = */ nullptr,
-    /* .event_free           = */ nullptr,
-    /* .event_synchronize    = */ nullptr,
+    /* .event_new            = */ ggml_backend_meta_device_event_new,
+    /* .event_free           = */ ggml_backend_meta_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
 };
 
 static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -476,7 +510,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend
     return buf_ctx->bufs[index].get();
 }
 
-static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
+struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
@@ -1745,6 +1779,25 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     }
 }
 
+static void ggml_backend_meta_buffer_get_tensor_n(ggml_backend_buffer_t buffer,
+        const ggml_tensor * const * tensors, void * const * data,
+        const size_t * offsets, const size_t * sizes, size_t n) {
+    std::vector<const ggml_tensor *> simple;
+    ggml_backend_buffer_t buf = nullptr;
+    for (size_t i=0;i<n;++i) {
+        const auto state=ggml_backend_meta_get_split_state(tensors[i],false);
+        if (state.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) break;
+        const auto * t=ggml_backend_meta_buffer_simple_tensor(tensors[i],0);
+        if (buf && buf != t->buffer) break;
+        buf=t->buffer;simple.push_back(t);
+    }
+    if (simple.size()==n && buf && buf->iface.get_tensor_n) {
+        buf->iface.get_tensor_n(buf,simple.data(),data,offsets,sizes,n);
+        return;
+    }
+    for(size_t i=0;i<n;++i) ggml_backend_meta_buffer_get_tensor(buffer,tensors[i],data[i],offsets[i],sizes[i]);
+}
+
 static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
@@ -1758,7 +1811,7 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
     /* .clear           = */ ggml_backend_meta_buffer_clear,
     /* .reset           = */ ggml_backend_meta_buffer_reset,
     /* .set_tensor_n    = */ NULL,
-    /* .get_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ ggml_backend_meta_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ NULL,
 };
 
@@ -1886,6 +1939,7 @@ struct ggml_backend_meta_context {
     };
     std::string                 name;
     std::vector<backend_config> backend_configs;
+    ggml_backend_buffer_ptr input_stage; // synchronous batch completion protects reuse
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
@@ -1898,6 +1952,285 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+
+    typedef int      (*comm_ar_prepare_t)(void *, struct ggml_tensor **, void *, size_t);
+    typedef void     (*comm_ar_launch_rank_t)(void *, int, struct ggml_tensor *, const void *);
+    typedef void     (*graph_owner_fn_t)(ggml_backend_t);
+    typedef uint64_t (*graph_epoch_fn_t)(ggml_backend_t);
+    typedef bool     (*cuda_graph_is_compatible_t)(ggml_backend_t, struct ggml_cgraph *);
+    typedef bool     (*token_capture_begin_t)(ggml_backend_t);
+    typedef bool     (*token_capture_end_t)(ggml_backend_t, void **, void **);
+    typedef bool     (*token_graph_launch_t)(ggml_backend_t, void *);
+    typedef void     (*token_graph_free_t)(ggml_backend_t, void *, void *);
+
+    struct TokenGraphState {
+        static constexpr size_t CACHE_CAP = 16;
+
+        struct Entry {
+            uint64_t uid         = 0;
+            size_t   n_subgraphs = 0;
+            uint64_t signature   = 0;
+            uint64_t epochs[2]   = { 0, 0 };
+            int      seen        = 0;
+            bool     captured    = false;
+            bool     failed      = false;
+            uint64_t last_use    = 0;
+            uint64_t launches    = 0;
+            void *   graphs[2]   = { nullptr, nullptr };
+            void *   execs[2]    = { nullptr, nullptr };
+        };
+
+        bool     enabled              = false;
+        int      warm_needed          = 2;
+        int      min_subgraphs        = 8;
+        bool     owner_held           = false;
+        uint64_t use_seq              = 0;
+        uint64_t total_captures       = 0;
+        uint64_t total_launches       = 0;
+        uint64_t total_evicts         = 0;
+        uint64_t total_sig_invals     = 0;
+        uint64_t total_epoch_invals   = 0;
+        uint64_t total_cap_fails      = 0;
+        uint64_t total_skipped_small  = 0;
+        uint64_t total_owner_releases = 0;
+        Entry    entries[CACHE_CAP];
+
+        comm_ar_prepare_t          ar_prepare     = nullptr;
+        comm_ar_launch_rank_t      ar_launch_rank = nullptr;
+        graph_owner_fn_t           owner_acquire  = nullptr;
+        graph_owner_fn_t           owner_release  = nullptr;
+        graph_epoch_fn_t           graph_epoch    = nullptr;
+        cuda_graph_is_compatible_t is_compatible  = nullptr;
+        token_capture_begin_t      capture_begin  = nullptr;
+        token_capture_end_t        capture_end    = nullptr;
+        token_graph_launch_t       graph_launch   = nullptr;
+        token_graph_free_t         graph_free     = nullptr;
+
+        static uint64_t fnv1a_bytes(uint64_t h, const void * data, size_t len) {
+            const uint8_t * p = (const uint8_t *) data;
+            // A signature is an invalidation key, not a serialized format. Mix full
+            // words to avoid a byte-wise dependency chain over every graph tensor.
+            // memcpy permits unaligned fields and never reads beyond the span.
+            while (len >= sizeof(uint64_t)) {
+                uint64_t word;
+                std::memcpy(&word, p, sizeof(word));
+                h ^= word;
+                h *= 1099511628211ULL;
+                h ^= h >> 32;
+                p += sizeof(word);
+                len -= sizeof(word);
+            }
+            while (len--) {
+                h ^= *p++;
+                h *= 1099511628211ULL;
+            }
+            return h;
+        }
+
+        template <typename T>
+        static uint64_t fnv1a_val(uint64_t h, const T & v) {
+            return fnv1a_bytes(h, &v, sizeof(T));
+        }
+
+        static uint64_t compute_signature(const std::vector<backend_config> & bcs, size_t n_subgraphs) {
+            const int64_t start_us = ggml_time_us();
+            uint64_t h = 14695981039346656037ULL;
+            h = fnv1a_val(h, n_subgraphs);
+            for (size_t j = 0; j < 2 && j < bcs.size(); ++j) {
+                const auto & bcj = bcs[j];
+                for (size_t i = 0; i < n_subgraphs; ++i) {
+                    const ggml_cgraph * cg = bcj.cgraphs[i].cgraph_main;
+                    h = fnv1a_val(h, cg->n_nodes);
+                    h = fnv1a_val(h, cg->n_leafs);
+                    for (int k = 0; k < cg->n_nodes; ++k) {
+                        const ggml_tensor * t = cg->nodes[k];
+                        const uint32_t op_u   = (uint32_t) t->op;
+                        const uint32_t type_u = (uint32_t) t->type;
+                        const int32_t  flg    = t->flags;
+                        const uintptr_t dptr  = (uintptr_t) t->data;
+                        h = fnv1a_val(h, op_u);
+                        h = fnv1a_val(h, type_u);
+                        h = fnv1a_val(h, flg);
+                        h = fnv1a_val(h, dptr);
+                        h = fnv1a_bytes(h, t->ne, sizeof(t->ne));
+                        h = fnv1a_bytes(h, t->nb, sizeof(t->nb));
+                        h = fnv1a_bytes(h, t->op_params, sizeof(t->op_params));
+                        h = fnv1a_val(h, t->view_offs);
+                        const uintptr_t vsrc = (uintptr_t) (t->view_src ? t->view_src->data : nullptr);
+                        h = fnv1a_val(h, vsrc);
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            const ggml_tensor * src = t->src[s];
+                            const uintptr_t sptr = (uintptr_t) (src ? src->data : nullptr);
+                            h = fnv1a_val(h, sptr);
+                            if (src) {
+                                const uint32_t st = (uint32_t) src->type;
+                                h = fnv1a_val(h, st);
+                                h = fnv1a_bytes(h, src->ne, sizeof(src->ne));
+                                h = fnv1a_bytes(h, src->nb, sizeof(src->nb));
+                            }
+                        }
+                    }
+                }
+            }
+            if (getenv("T2012_TRACE") && ggml_time_us()-start_us > 100) fprintf(stderr,"[t2012-time] tg-signature us=%lld subgraphs=%zu\n",(long long)(ggml_time_us()-start_us),n_subgraphs);
+            return h;
+        }
+
+        void set_inner_owner(std::vector<backend_config> & bcs, bool hold) {
+            if (owner_held == hold || !owner_acquire || !owner_release) {
+                return;
+            }
+            for (auto & bc : bcs) {
+                if (hold) {
+                    owner_acquire(bc.backend);
+                } else {
+                    owner_release(bc.backend);
+                }
+            }
+            if (!hold) {
+                total_owner_releases++;
+            }
+            owner_held = hold;
+        }
+
+        void free_entry(std::vector<backend_config> & bcs, Entry & e) {
+            if (graph_free) {
+                for (size_t j = 0; j < 2 && j < bcs.size(); ++j) {
+                    if (e.graphs[j] != nullptr || e.execs[j] != nullptr) {
+                        graph_free(bcs[j].backend, e.graphs[j], e.execs[j]);
+                        e.graphs[j] = nullptr;
+                        e.execs[j]  = nullptr;
+                    }
+                }
+            }
+            e = Entry{};
+        }
+
+        Entry & acquire_entry(
+                std::vector<backend_config> & bcs,
+                uint64_t                      uid,
+                size_t                        n_subgraphs,
+                uint64_t                      sig,
+                const uint64_t                cur_epochs[2]) {
+            use_seq++;
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                if (entries[i].uid == uid) {
+                    Entry & e = entries[i];
+                    const bool epoch_changed =
+                        e.epochs[0] != cur_epochs[0] || e.epochs[1] != cur_epochs[1];
+                    const bool sig_changed =
+                        e.n_subgraphs != n_subgraphs || e.signature != sig;
+                    if (epoch_changed) {
+                        if (e.captured || e.seen > 0) {
+                            total_epoch_invals++;
+                        }
+                        free_entry(bcs, e);
+                        e.uid         = uid;
+                        e.n_subgraphs = n_subgraphs;
+                        e.signature   = sig;
+                        e.epochs[0]   = cur_epochs[0];
+                        e.epochs[1]   = cur_epochs[1];
+                    } else if (sig_changed) {
+                        if (e.captured || e.failed || e.seen > 0) {
+                            total_sig_invals++;
+                        }
+                        free_entry(bcs, e);
+                        e.uid         = uid;
+                        e.n_subgraphs = n_subgraphs;
+                        e.signature   = sig;
+                        e.epochs[0]   = cur_epochs[0];
+                        e.epochs[1]   = cur_epochs[1];
+                    }
+                    e.last_use = use_seq;
+                    return e;
+                }
+            }
+
+            size_t victim = CACHE_CAP;
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                if (entries[i].uid == 0) {
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim == CACHE_CAP) {
+                for (size_t i = 0; i < CACHE_CAP; ++i) {
+                    if (!entries[i].captured) {
+                        if (victim == CACHE_CAP || entries[i].last_use < entries[victim].last_use) {
+                            victim = i;
+                        }
+                    }
+                }
+            }
+            if (victim == CACHE_CAP) {
+                victim = 0;
+                for (size_t i = 1; i < CACHE_CAP; ++i) {
+                    if (entries[i].last_use < entries[victim].last_use) {
+                        victim = i;
+                    }
+                }
+            }
+            if (entries[victim].uid != 0) {
+                if (entries[victim].captured) {
+                    total_evicts++;
+                }
+                free_entry(bcs, entries[victim]);
+            }
+            entries[victim].uid         = uid;
+            entries[victim].n_subgraphs = n_subgraphs;
+            entries[victim].signature   = sig;
+            entries[victim].epochs[0]   = cur_epochs[0];
+            entries[victim].epochs[1]   = cur_epochs[1];
+            entries[victim].last_use    = use_seq;
+            return entries[victim];
+        }
+
+        void reset(std::vector<backend_config> & bcs) {
+            if (getenv("T2012_TRACE")) fprintf(stderr, "[t2012-tg] enabled=%d captures=%llu launches=%llu sig=%llu epoch=%llu fail=%llu small=%llu\n", enabled,
+                (unsigned long long)total_captures, (unsigned long long)total_launches,
+                (unsigned long long)total_sig_invals, (unsigned long long)total_epoch_invals,
+                (unsigned long long)total_cap_fails, (unsigned long long)total_skipped_small);
+            set_inner_owner(bcs, false);
+            if (enabled && (total_captures > 0 || total_launches > 0)) {
+                GGML_LOG_INFO(
+                    "meta backend whole-token HIP graph stats: captures=%llu launches=%llu evicts=%llu "
+                    "sig_inval=%llu epoch_inval=%llu cap_fail=%llu skip_small=%llu owner_rel=%llu\n",
+                    (unsigned long long) total_captures,
+                    (unsigned long long) total_launches,
+                    (unsigned long long) total_evicts,
+                    (unsigned long long) total_sig_invals,
+                    (unsigned long long) total_epoch_invals,
+                    (unsigned long long) total_cap_fails,
+                    (unsigned long long) total_skipped_small,
+                    (unsigned long long) total_owner_releases);
+            }
+            for (size_t i = 0; i < CACHE_CAP; ++i) {
+                free_entry(bcs, entries[i]);
+            }
+        }
+    } tg;
+
+    static bool env_enabled(const char * name) {
+        const char * v = std::getenv(name);
+        return v && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }
+
+    static bool env_flag_or(const char * name, bool def) {
+        const char * v = std::getenv(name);
+        if (!v || v[0] == '\0') { return def; }
+        return std::strcmp(v, "0") != 0;
+    }
+
+    static int env_int(const char * name, int def, int lo, int hi) {
+        const char * v = std::getenv(name);
+        if (!v || v[0] == '\0') { return def; }
+        char * end = nullptr;
+        long val = std::strtol(v, &end, 10);
+        if (end == v) { return def; }
+        if (val < lo) { return lo; }
+        if (val > hi) { return hi; }
+        return (int) val;
+    }
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1925,14 +2258,41 @@ struct ggml_backend_meta_context {
             }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t reg0 = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            const bool want_tg_umbrella = env_enabled("GGML_HIP_AR_TG");
+            const bool want_token_graph = env_flag_or("GGML_META_TOKEN_GRAPH", want_tg_umbrella);
+            if (want_token_graph && simple_backends.size() == 2) {
+                tg.warm_needed    = env_int("GGML_META_TG_WARM", 2, 2, 16);
+                tg.min_subgraphs  = env_int("GGML_META_TG_MIN_SUBGRAPHS", 8, 2, 1024);
+                tg.ar_prepare     = (comm_ar_prepare_t)          ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_prepare");
+                tg.ar_launch_rank = (comm_ar_launch_rank_t)      ggml_backend_reg_get_proc_address(reg0, "ggml_backend_comm_allreduce_launch_rank");
+                tg.owner_acquire  = (graph_owner_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_owner_acquire");
+                tg.owner_release  = (graph_owner_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_owner_release");
+                tg.graph_epoch    = (graph_epoch_fn_t)           ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_epoch");
+                tg.is_compatible  = (cuda_graph_is_compatible_t) ggml_backend_reg_get_proc_address(reg0, "ggml_backend_cuda_graph_is_compatible");
+                tg.capture_begin  = (token_capture_begin_t)      ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_capture_begin");
+                tg.capture_end    = (token_capture_end_t)        ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_capture_end");
+                tg.graph_launch   = (token_graph_launch_t)       ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_graph_launch");
+                tg.graph_free     = (token_graph_free_t)         ggml_backend_reg_get_proc_address(reg0, "ggml_backend_token_graph_free");
+                if (getenv("T2012_TRACE")) fprintf(stderr, "[t2012-tg] api=%d%d%d%d%d%d%d%d%d%d\n", !!tg.ar_prepare, !!tg.ar_launch_rank, !!tg.owner_acquire, !!tg.owner_release,
+                    !!tg.graph_epoch, !!tg.is_compatible, !!tg.capture_begin, !!tg.capture_end, !!tg.graph_launch, !!tg.graph_free);
+                if (tg.ar_prepare && tg.ar_launch_rank && tg.owner_acquire && tg.owner_release &&
+                    tg.graph_epoch && tg.is_compatible && tg.capture_begin && tg.capture_end &&
+                    tg.graph_launch && tg.graph_free) {
+                    tg.enabled = true;
+                    GGML_LOG_INFO("meta backend whole-token HIP graph enabled (warm_needed=%d, min_subgraphs=%d)\n",
+                        tg.warm_needed, tg.min_subgraphs);
+                }
+            }
         }
     }
 
     ~ggml_backend_meta_context() {
+        tg.reset(backend_configs);
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2048,11 +2408,206 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     }
 }
 
+static void ggml_backend_meta_synchronize(ggml_backend_t backend);
+
+// Checkpoint copies must not fall through the generic host staging path.
+// Only identical shard layouts are eligible; validate all ranks before enqueue.
+static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+        const ggml_tensor * src, ggml_tensor * dst) {
+    // instrumentação da rota de cópia do Meta (env-gated)
+    static const bool t2022_trace = getenv("T2012_TRACE") != nullptr;
+    const int64_t t2022_us = ggml_time_us();
+    size_t t2022_copies = 0;
+    const char * t2022_path = "fallback";
+    struct t2022_report {
+        const ggml_tensor * src; bool enabled; int64_t start_us; size_t * copies; const char ** path;
+        ~t2022_report() {
+            if (!enabled || ggml_nbytes(src) < (1u << 20)) { return; }
+            fprintf(stderr, "[t2022-route] meta-copy src=%s bytes=%zu copies=%zu path=%s ms=%.3f\n",
+                    src->name, ggml_nbytes(src), *copies, *path, (ggml_time_us() - start_us)/1000.0);
+        }
+    } t2022_rep{src, t2022_trace, t2022_us, &t2022_copies, &t2022_path};
+    if (!ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst) ||
+            !ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer)) return false;
+    const size_t n = ggml_backend_meta_n_backends(backend_src);
+    if (n != ggml_backend_meta_n_backends(backend_dst)) return false;
+    const auto a = ggml_backend_meta_get_split_state(src, false);
+    const auto b = ggml_backend_meta_get_split_state(dst, false);
+    const bool gather = a.axis == GGML_BACKEND_SPLIT_AXIS_0 && b.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    const bool scatter = b.axis == GGML_BACKEND_SPLIT_AXIS_0 && a.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    if ((gather || scatter) && (gather ? b.n_segments == 1 : a.n_segments == 1) &&
+            ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        // A flat checkpoint is mirrored while the live recurrent cache is split.
+        // Materialize the exact logical byte stream on every destination rank;
+        // restore selects each rank's local slice. Never silently change storage.
+        const auto * split = gather ? src : dst;
+        const size_t full_row = split->nb[1];
+        const size_t rows = ggml_nbytes(split)/full_row;
+        const auto & state = gather ? a : b;
+        struct span { size_t rank, local, logical, bytes; };
+        std::vector<span> spans;
+        std::vector<size_t> local_offsets(n,0);
+        size_t logical_offset=0;
+        const size_t block=ggml_blck_size(split->type), elem=ggml_type_size(split->type);
+        for(size_t s=0;s<state.n_segments;++s) {
+            if (!state.nr[s] || state.nr[s] > (size_t)split->ne[0]) return false;
+            for(size_t r=0;r<state.nr[s];++r) for(size_t j=0;j<n;++j) {
+                if (state.ne[s*n+j] < 0 || state.ne[s*n+j] % block) return false;
+                const size_t bytes=(state.ne[s*n+j]/block)*elem;
+                if (logical_offset > full_row || bytes > full_row-logical_offset) return false;
+                spans.push_back({j,local_offsets[j],logical_offset,bytes});
+                local_offsets[j]+=bytes;logical_offset+=bytes;
+            }
+        }
+        if (logical_offset != full_row) return false;
+        size_t covered = 0;
+        for (size_t j = 0; j < n; ++j) {
+            auto * st = ggml_backend_meta_buffer_simple_tensor(split,j);
+            if (!ggml_is_contiguous(st) || ggml_nbytes(st) != rows*st->nb[1] || local_offsets[j] != st->nb[1]) return false;
+            covered += st->nb[1];
+            if (ggml_backend_get_device(ggml_backend_meta_simple_backend(backend_src,j)) !=
+                    ggml_backend_get_device(ggml_backend_meta_simple_backend(backend_dst,j))) return false;
+        }
+        if (covered != full_row) return false;
+        ggml_backend_synchronize(backend_src);
+        if (backend_dst != backend_src) ggml_backend_synchronize(backend_dst);
+        auto flat = [](const ggml_tensor * parent, size_t off, size_t bytes) {
+            ggml_tensor t = *parent;
+            t.data = (char *)parent->data+off; t.view_src = nullptr; t.view_offs = 0;
+            t.ne[0] = (bytes/ggml_type_size(t.type))*ggml_blck_size(t.type);
+            t.nb[0] = ggml_type_size(t.type);
+            for (int d=1;d<GGML_MAX_DIMS;++d) { t.ne[d]=1; t.nb[d]=bytes; }
+            return t;
+        };
+        for (const auto & part : spans) {
+            const size_t j=part.rank;
+            const size_t width=part.bytes;
+            const size_t local_row=local_offsets[j];
+            for(size_t k=0;k<(gather?n:1);++k) {
+                const size_t srank=j, drank=gather?k:j;
+                const auto * ss=ggml_backend_meta_buffer_simple_tensor(src,srank);
+                auto * dd=ggml_backend_meta_buffer_simple_tensor(dst,drank);
+                for(size_t row=0;row<rows && width;++row) {
+                    auto from=flat(ss,gather?row*local_row+part.local:row*full_row+part.logical,width);
+                    auto to=flat(dd,gather?row*full_row+part.logical:row*local_row+part.local,width);
+                    ggml_backend_tensor_copy_async(ggml_backend_meta_simple_backend(backend_src,srank),
+                        ggml_backend_meta_simple_backend(backend_dst,drank),&from,&to);
+                    ++t2022_copies;
+                }
+            }
+        }
+        if (getenv("T2012_TRACE")) fprintf(stderr,"[t2012-copy] %s bytes=%zu ranks=%zu\n",gather?"gather-D2D":"scatter-D2D",ggml_nbytes(src),n);
+        t2022_path = gather ? "gather-D2D" : "scatter-D2D";
+        return true;
+    }
+    if (a.axis != b.axis || a.n_segments != b.n_segments) {
+        if (getenv("T2012_TRACE")) fprintf(stderr,"[t2012-copy] fallback axes=%d/%d seg=%u/%u name=%s\n",int(a.axis),int(b.axis),a.n_segments,b.n_segments,src->name);
+        return false;
+    }
+    for (size_t s = 0; s < a.n_segments; ++s) {
+        if (a.nr[s] != b.nr[s]) return false;
+        if (a.axis >= 0 && a.axis < GGML_MAX_DIMS) {
+            for (size_t j = 0; j < n; ++j) if (a.ne[s*n+j] != b.ne[s*n+j]) return false;
+        }
+    }
+    for (size_t j = 0; j < n; ++j) {
+        auto * sb = ggml_backend_meta_simple_backend(backend_src,j);
+        auto * db = ggml_backend_meta_simple_backend(backend_dst,j);
+        if (ggml_backend_get_device(sb) != ggml_backend_get_device(db) ||
+                !ggml_are_same_layout(ggml_backend_meta_buffer_simple_tensor(src,j),ggml_backend_meta_buffer_simple_tensor(dst,j))) return false;
+    }
+    for (size_t j = 0; j < n; ++j) {
+        auto * sb = ggml_backend_meta_simple_backend(backend_src,j);
+        auto * db = ggml_backend_meta_simple_backend(backend_dst,j);
+        auto * st = ggml_backend_meta_buffer_simple_tensor(src,j);
+        auto * dt = ggml_backend_meta_buffer_simple_tensor(dst,j);
+        if (ggml_nbytes(st)) { ggml_backend_tensor_copy_async(sb,db,st,dt); ++t2022_copies; }
+    }
+    if (getenv("T2012_TRACE")) fprintf(stderr,"[t2012-copy] local D2D bytes=%zu ranks=%zu axis=%d\n",ggml_nbytes(src),n,int(a.axis));
+    t2022_path = "local-D2D";
+    return true;
+}
+
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+}
+
+// Internal scheduler fast path (port of the previous revision: GGML_SCHED_INPUT_BATCH).
+// Validate the entire batch before submitting anything: partial/segmented/non-host inputs
+// retain the synchronous fallback. Whole contiguous axis-0/1/2 inputs use the existing
+// async splice path. Completion before return preserves the caller's right to overwrite
+// the host data of a user input.
+bool ggml_backend_meta_set_input_batch(ggml_backend_t backend, ggml_tensor ** src, ggml_tensor ** dst, size_t n) {
+    static const bool trace = getenv("GGML_SCHED_INPUT_BATCH_LOG") != nullptr;
+    if (trace) { fprintf(stderr, "[meta-input] attempt n=%zu\n", n); }
+    for (size_t i = 0; i < n; ++i) {
+        GGML_ASSERT(ggml_are_same_layout(src[i], dst[i]));
+        // Empty scheduler leaves legitimately have UNKNOWN split state. The
+        // normal tensor_set is a no-op for them; do not reject the whole batch.
+        if (src[i] == dst[i] || ggml_nbytes(src[i]) == 0) {
+            continue;
+        }
+        if (src[i]->buffer == nullptr || !ggml_backend_buffer_is_host(src[i]->buffer) || !ggml_is_contiguous(dst[i])) {
+            if (trace) { fprintf(stderr, "[meta-input] fallback host/layout %s\n", dst[i]->name); }
+            return false;
+        }
+        if (dst[i]->buffer == nullptr || !ggml_backend_buffer_is_meta(dst[i]->buffer)) {
+            if (trace) { fprintf(stderr, "[meta-input] fallback non-meta %s\n", dst[i]->name); }
+            return false;
+        }
+        const auto state = ggml_backend_meta_get_split_state(dst[i], false);
+        const bool supported_axis = state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            (state.axis >= GGML_BACKEND_SPLIT_AXIS_0 && state.axis <= GGML_BACKEND_SPLIT_AXIS_2) ||
+            state.axis == GGML_BACKEND_SPLIT_AXIS_NONE;
+        if (!supported_axis || state.n_segments != 1 || state.nr[0] != 1) {
+            if (trace) { fprintf(stderr, "[meta-input] fallback %s axis=%d seg=%u nr=%u\n", dst[i]->name, int(state.axis), state.n_segments, state.nr[0]); }
+            return false;
+        }
+    }
+    if (n) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr, "[meta-input] batch active: %zu host tensors per split\n", n);
+        }
+    }
+    // Decode inputs are small, numerous, and often pageable. Snapshot into one
+    // pinned arena, retaining the existing completion-before-return contract.
+    auto * context=(ggml_backend_meta_context *)backend->context;
+    const char * opt=getenv("GGML_HIP_IO_PINNED");
+    constexpr size_t cap=16*1024*1024;
+    size_t total=0;
+    bool can_stage=opt && atoi(opt)!=0;
+    for(size_t i=0;i<n && can_stage;++i) {
+        const size_t bytes=src[i]!=dst[i]?ggml_nbytes(src[i]):0;
+        if(bytes>cap-total) can_stage=false;else total+=bytes;
+    }
+    char * staging=nullptr;
+    if(can_stage && total) {
+        auto * host_type=ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        if(host_type) {
+            if(!context->input_stage) context->input_stage.reset(ggml_backend_buft_alloc_buffer(host_type,cap));
+            if(context->input_stage && ggml_backend_buffer_get_type(context->input_stage.get())==host_type)
+                staging=(char *)ggml_backend_buffer_get_base(context->input_stage.get());
+        }
+    }
+    size_t staged=0;
+    for (size_t i = 0; i < n; ++i) {
+        if (src[i] != dst[i] && ggml_nbytes(src[i]) != 0) {
+            const size_t bytes=ggml_nbytes(src[i]);
+            const void * input=src[i]->data;
+            if(staging) { memcpy(staging+staged,input,bytes);input=staging+staged;staged+=bytes; }
+            ggml_backend_meta_set_tensor_async(backend, dst[i], input, 0, bytes);
+        }
+    }
+    if (n) {
+        ggml_backend_meta_synchronize(backend);
+    }
+    if (trace) { fprintf(stderr, "[meta-input] completed n=%zu\n", n); }
+    return true;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2065,6 +2620,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
+        if (backend_ctx->tg.enabled) {
+            backend_ctx->tg.reset(backend_ctx->backend_configs);
+        }
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             bcj.nodes.resize(cgraph->n_nodes);
@@ -2529,6 +3087,173 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    auto & tg = backend_ctx->tg;
+    tg.set_inner_owner(backend_ctx->backend_configs, false);
+    if (tg.enabled && backend_ctx->comm_ctx && n_backends == 2 && cgraph->uid != 0) {
+        if (backend_ctx->n_subgraphs < (size_t) tg.min_subgraphs) {
+            tg.total_skipped_small++;
+        } else {
+            const uint64_t cur_epochs[2] = {
+                tg.graph_epoch(backend_ctx->backend_configs[0].backend),
+                tg.graph_epoch(backend_ctx->backend_configs[1].backend),
+            };
+            const uint64_t sig = ggml_backend_meta_context::TokenGraphState::compute_signature(
+                backend_ctx->backend_configs, backend_ctx->n_subgraphs);
+            auto & entry = tg.acquire_entry(
+                backend_ctx->backend_configs, cgraph->uid, backend_ctx->n_subgraphs, sig, cur_epochs);
+
+            if (entry.captured) {
+                bool launch_ok = true;
+                for (size_t j = 0; j < 2; ++j) {
+                    if (!tg.graph_launch(backend_ctx->backend_configs[j].backend, entry.execs[j])) {
+                        launch_ok = false;
+                        break;
+                    }
+                }
+                if (launch_ok) {
+                    entry.launches++;
+                    tg.total_launches++;
+                    return GGML_STATUS_SUCCESS;
+                }
+                tg.free_entry(backend_ctx->backend_configs, entry);
+                entry.uid         = cgraph->uid;
+                entry.n_subgraphs = backend_ctx->n_subgraphs;
+                entry.signature   = sig;
+                entry.epochs[0]   = cur_epochs[0];
+                entry.epochs[1]   = cur_epochs[1];
+                entry.last_use    = tg.use_seq;
+                entry.failed      = true;
+                tg.total_cap_fails++;
+            } else if (!entry.failed) {
+                struct alignas(16) ar_plan_buf {
+                    unsigned char raw[64];
+                };
+                std::vector<ar_plan_buf> plans(backend_ctx->n_subgraphs - 1);
+                bool eligible = true;
+                for (size_t i = 0; i < backend_ctx->n_subgraphs && eligible; ++i) {
+                    for (size_t j = 0; j < 2; ++j) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        if (!tg.is_compatible(bcj.backend, bcj.cgraphs[i].cgraph_main)) {
+                            eligible = false;
+                            break;
+                        }
+                    }
+                    if (eligible && i < backend_ctx->n_subgraphs - 1) {
+                        ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                        ggml_cgraph * cg1 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                        ggml_tensor * nodes[2] = {
+                            cg0->nodes[cg0->n_nodes - 1],
+                            cg1->nodes[cg1->n_nodes - 1]
+                        };
+                        if (tg.ar_prepare(backend_ctx->comm_ctx, nodes, plans[i].raw, sizeof(plans[i].raw)) != 1) {
+                            eligible = false;
+                        }
+                    }
+                }
+
+                if (!eligible) {
+                    entry.failed = true;
+                } else {
+                    entry.seen++;
+                    if (entry.seen >= tg.warm_needed) {
+                        tg.set_inner_owner(backend_ctx->backend_configs, true);
+                        bool began[2] = { false, false };
+                        bool cap_ok = true;
+                        for (size_t j = 0; j < 2; ++j) {
+                            if (!tg.capture_begin(backend_ctx->backend_configs[j].backend)) {
+                                cap_ok = false;
+                                break;
+                            }
+                            began[j] = true;
+                        }
+                        if (!cap_ok) {
+                            for (size_t j = 0; j < 2; ++j) {
+                                if (began[j]) {
+                                    void * dg = nullptr;
+                                    void * de = nullptr;
+                                    tg.capture_end(backend_ctx->backend_configs[j].backend, &dg, &de);
+                                    tg.graph_free(backend_ctx->backend_configs[j].backend, dg, de);
+                                }
+                            }
+                            tg.set_inner_owner(backend_ctx->backend_configs, false);
+                            entry.failed = true;
+                            tg.total_cap_fails++;
+                        } else {
+                            ggml_status cap_status = GGML_STATUS_SUCCESS;
+                            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                                for (size_t j = 0; j < 2; ++j) {
+                                    auto & bcj = backend_ctx->backend_configs[j];
+                                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                                    if (status != GGML_STATUS_SUCCESS) {
+                                        cap_status = status;
+                                        break;
+                                    }
+                                }
+                                if (cap_status != GGML_STATUS_SUCCESS) {
+                                    break;
+                                }
+                                if (i < backend_ctx->n_subgraphs - 1) {
+                                    ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                                    ggml_cgraph * cg1 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                                    tg.ar_launch_rank(backend_ctx->comm_ctx, 0, cg0->nodes[cg0->n_nodes - 1], plans[i].raw);
+                                    tg.ar_launch_rank(backend_ctx->comm_ctx, 1, cg1->nodes[cg1->n_nodes - 1], plans[i].raw);
+                                }
+                            }
+                            bool end_ok = (cap_status == GGML_STATUS_SUCCESS);
+                            void * new_g[2] = { nullptr, nullptr };
+                            void * new_e[2] = { nullptr, nullptr };
+                            for (size_t j = 0; j < 2; ++j) {
+                                if (!tg.capture_end(backend_ctx->backend_configs[j].backend, &new_g[j], &new_e[j])) {
+                                    end_ok = false;
+                                }
+                            }
+                            tg.set_inner_owner(backend_ctx->backend_configs, false);
+
+                            if (end_ok && new_e[0] != nullptr && new_e[1] != nullptr) {
+                                entry.graphs[0] = new_g[0]; entry.graphs[1] = new_g[1];
+                                entry.execs[0]  = new_e[0]; entry.execs[1]  = new_e[1];
+                                entry.captured  = true;
+                                tg.total_captures++;
+                                ggml_cgraph * cg0_first = backend_ctx->backend_configs[0].cgraphs[0].cgraph_main;
+                                int64_t ne0 = (cg0_first->n_nodes > 0) ? ggml_nelements(cg0_first->nodes[cg0_first->n_nodes - 1]) : 0;
+                                GGML_LOG_INFO("meta backend whole-token HIP graph captured (n_subgraphs=%zu, ar=%zu, uid=%llu, ne0=%lld, cap=%llu)\n",
+                                    backend_ctx->n_subgraphs, backend_ctx->n_subgraphs - 1,
+                                    (unsigned long long) cgraph->uid, (long long) ne0, (unsigned long long) tg.total_captures);
+                                bool first_launch_ok = true;
+                                for (size_t j = 0; j < 2; ++j) {
+                                    if (!tg.graph_launch(backend_ctx->backend_configs[j].backend, entry.execs[j])) {
+                                        first_launch_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (first_launch_ok) {
+                                    entry.launches++;
+                                    tg.total_launches++;
+                                    return GGML_STATUS_SUCCESS;
+                                }
+                            } else {
+                                for (size_t j = 0; j < 2; ++j) {
+                                    tg.graph_free(backend_ctx->backend_configs[j].backend, new_g[j], new_e[j]);
+                                }
+                            }
+                            GGML_LOG_WARN("meta backend whole-token HIP graph capture/launch failed (uid=%llu, subgraphs=%zu), falling back to per-subgraph\n",
+                                (unsigned long long) cgraph->uid, backend_ctx->n_subgraphs);
+                            tg.free_entry(backend_ctx->backend_configs, entry);
+                            entry.uid         = cgraph->uid;
+                            entry.n_subgraphs = backend_ctx->n_subgraphs;
+                            entry.signature   = sig;
+                            entry.epochs[0]   = cur_epochs[0];
+                            entry.epochs[1]   = cur_epochs[1];
+                            entry.last_use    = tg.use_seq;
+                            entry.failed      = true;
+                            tg.total_cap_fails++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2562,6 +3287,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_backend_meta_event_record(ggml_backend_t backend,ggml_backend_event_t event) {
+    const auto * ec=(const ggml_backend_meta_event_context *)event->context;
+    const size_t n=ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ec->events.size()==n);
+    for(size_t j=0;j<n;++j) {
+        auto * simple=ggml_backend_meta_simple_backend(backend,j);
+        GGML_ASSERT(ggml_backend_get_device(simple)==ec->events[j]->device);
+        ggml_backend_event_record(ec->events[j],simple);
+    }
+}
+static void ggml_backend_meta_event_wait(ggml_backend_t backend,ggml_backend_event_t event) {
+    const auto * ec=(const ggml_backend_meta_event_context *)event->context;
+    const size_t n=ggml_backend_meta_n_backends(backend);
+    GGML_ASSERT(ec->events.size()==n);
+    // Completion means all ranks, not just the matching rank.
+    for(size_t j=0;j<n;++j) {
+        auto * simple=ggml_backend_meta_simple_backend(backend,j);
+        GGML_ASSERT(ggml_backend_get_device(simple)==ec->events[j]->device);
+        for(auto * child:ec->events) ggml_backend_event_wait(simple,child);
+    }
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -2569,15 +3316,15 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
     /* .set_tensor_2d_async     = */ nullptr,
     /* .get_tensor_2d_async     = */ nullptr,
-    /* .cpy_tensor_async        = */ nullptr,
+    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_meta_synchronize,
     /* .graph_plan_create       = */ nullptr,
     /* .graph_plan_free         = */ nullptr,
     /* .graph_plan_update       = */ nullptr,
     /* .graph_plan_compute      = */ nullptr,
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
-    /* .event_record            = */ nullptr,
-    /* .event_wait              = */ nullptr,
+    /* .event_record            = */ ggml_backend_meta_event_record,
+    /* .event_wait              = */ ggml_backend_meta_event_wait,
     /* .graph_optimize          = */ nullptr,
 };
 
@@ -2606,4 +3353,42 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     GGML_ASSERT(ggml_backend_is_meta(meta_backend));
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
+}
+
+size_t ggml_backend_meta_tg_get_stats(ggml_backend_t meta_backend, uint64_t * out, size_t cap) {
+    if (!ggml_backend_is_meta(meta_backend) || out == nullptr) {
+        return 0;
+    }
+    const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
+    const uint64_t vals[8] = {
+        backend_ctx->tg.total_captures,
+        backend_ctx->tg.total_launches,
+        backend_ctx->tg.total_evicts,
+        backend_ctx->tg.total_sig_invals,
+        backend_ctx->tg.total_epoch_invals,
+        backend_ctx->tg.total_cap_fails,
+        backend_ctx->tg.total_skipped_small,
+        backend_ctx->tg.total_owner_releases,
+    };
+    const size_t n = std::min<size_t>(cap, 8);
+    std::memcpy(out, vals, n * sizeof(uint64_t));
+    return n;
+}
+
+// superfície mínima usada pelo save do checkpoint device para montar o plano físico
+// (peças contíguas por dispositivo) e copiar D2D local em vez de espelhar via peer copy.
+size_t ggml_backend_meta_buft_n_simple(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_meta_buft_n_bufts(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_buft_simple(ggml_backend_buffer_type_t buft, size_t index) {
+    return ggml_backend_meta_buft_simple_buft(buft, index);
+}
+
+size_t ggml_backend_meta_tensor_n_simple(const struct ggml_tensor * tensor) {
+    return ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+}
+
+struct ggml_backend_meta_split_state ggml_backend_meta_tensor_split_state(const struct ggml_tensor * tensor) {
+    return ggml_backend_meta_get_split_state(tensor, false);
 }

@@ -47,6 +47,8 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
+GGML_API ggml_gallocr_t ggml_gallocr_new_shared(ggml_gallocr_t src);
+GGML_API uint64_t       ggml_gallocr_get_buffer_epoch(ggml_gallocr_t galloc);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
@@ -70,6 +72,7 @@ GGML_API bool ggml_gallocr_reserve_n(
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+GGML_API bool ggml_gallocr_rebind_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
