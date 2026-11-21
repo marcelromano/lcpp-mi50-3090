@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "kv-admission-scope.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -15,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <memory>
+#include <type_traits>
 #include <map>
 #include <algorithm>
 #include <filesystem>
@@ -650,6 +653,9 @@ struct common_params {
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
+    common_kv_admission_scope kv_admission_scope = common_kv_admission_scope::all;
+    bool    kv_admission_restore = false; // enable native admitted restore
+    bool    kv_admission        = false; // guard attention KV growth at server dispatch
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
@@ -682,6 +688,10 @@ struct common_params {
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;
+    // Remote proxy principal bound to slot-operation requests; not a local backend/device name.
+    std::string slot_operation_owner = "proxy";
+    // Stable identity of this dedicated model endpoint across process epochs.
+    std::string slot_operation_engine_id;
 
     std::string ssl_file_key  = "";                                                                         // NOLINT
     std::string ssl_file_cert = "";                                                                         // NOLINT
@@ -1163,6 +1173,13 @@ struct common_batch {
     int32_t size() const { return (int32_t) tokens.size(); }
 };
 
+// short decode warm-up at startup (default LLAMA_DECODE_WARMUP=8 single-token steps plus the
+// usual verify depths 2..5). Writes only temporary positions to seq 0 and clears the memory right
+// after, so slots/KV/outputs are untouched; it exists to pay the graph capture/instantiation of the
+// decode and verify shapes before the first request instead of inside its predicted_ms.
+// n_steps < 0 reads LLAMA_DECODE_WARMUP (0 disables); all_no_output marks every entry without logits.
+void common_decode_warmup(struct llama_context * ctx, int n_steps = -1, bool all_no_output = false);
+
 // create a single-sequence batch from a list of tokens
 // positions continue from the memory, last token always have output_logits set to true
 common_batch common_batch_get_one(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
@@ -1335,6 +1352,11 @@ struct common_prompt_checkpoint {
 
     common_state_data data_tgt;
     common_state_data data_dft;
+    std::shared_ptr<llama_state_seq_device> device_tgt;
+    std::shared_ptr<llama_state_seq_device> device_dft;
+
+    // Materialize a saved snapshot without mutating the live sequence (disk/cache compatibility).
+    void to_host();
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

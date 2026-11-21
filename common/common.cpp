@@ -1429,6 +1429,95 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
+void common_decode_warmup(llama_context * ctx, int n_steps, bool all_no_output) {
+    if (n_steps < 0) {
+        const char * env = getenv("LLAMA_DECODE_WARMUP");
+        n_steps = env && *env ? atoi(env) : 8;
+    }
+    if (n_steps <= 0 || ctx == nullptr) {
+        return;
+    }
+
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return;
+    }
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    std::vector<llama_token> sample;
+    if (llama_vocab_bos(vocab) != LLAMA_TOKEN_NULL) {
+        sample.push_back(llama_vocab_bos(vocab));
+    }
+    if (llama_vocab_eos(vocab) != LLAMA_TOKEN_NULL) {
+        sample.push_back(llama_vocab_eos(vocab));
+    }
+    if (sample.empty()) {
+        sample.push_back(0);
+    }
+
+    const int n_batch  = (int) llama_n_batch(ctx);
+    const int n_verify = std::min(5, std::max(1, n_batch));
+    llama_pos pos = llama_memory_seq_pos_max(mem, 0) + 1;
+
+    std::vector<float> zeros;
+    int n_shapes    = 0;
+    int n_steps_run = 0;
+    int n_tok_run   = 0;
+
+    // one dummy ubatch of `n_tok` tokens at the current end of seq 0; the context's own graph type
+    // decides the topology (target verify vs MTP/draft), the same one a real request builds
+    auto run = [&](int n_tok) -> bool {
+        COM_INF("t2052 warm-up: begin n_tok=%d pos=%d\n", n_tok, (int) pos);
+        common_batch batch(ctx);
+        for (int i = 0; i < n_tok; ++i) {
+            const int32_t idx = batch.add(sample[(size_t) i % sample.size()], pos + i, 0,
+                    !all_no_output && i == n_tok - 1);
+            if (idx < 0) {
+                return false;
+            }
+        }
+        common_batch_set_zero_state(batch, model, zeros);
+        const int32_t rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        COM_INF("t2052 warm-up: done n_tok=%d rc=%d\n", n_tok, (int) rc);
+        if (rc != 0) {
+            return false;
+        }
+        pos     += n_tok;
+        n_tok_run += n_tok;
+        return true;
+    };
+
+    // verify shapes (1 + n_draft, usual depths) so the first request does not capture them either
+    for (int n = 2; n <= n_verify; ++n) {
+        if (!run(n)) {
+            break;
+        }
+        n_shapes++;
+    }
+    for (int i = 0; i < n_steps; ++i) {
+        if (!run(1)) {
+            break;
+        }
+        n_steps_run++;
+    }
+
+    // remove only the dummy positions; a full memory clear would reset the graph/scheduler
+    // cache (gf_cache_reset_results) and throw away exactly the graphs the warm-up just built
+    const bool removed = llama_memory_seq_rm(mem, 0, 0, -1);
+    llama_synchronize(ctx);
+    if (!removed) {
+        // memories that cannot drop positions (e.g. recurrent state) fall back to a full clear
+        llama_memory_clear(mem, true);
+        llama_synchronize(ctx);
+    }
+    llama_perf_context_reset(ctx);
+
+    COM_INF("%s: %d verify shapes + %d single-token steps (%d warm-up tokens, removed=%d)\n",
+            __func__, n_shapes, n_steps_run, n_tok_run, (int) removed);
+}
+
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
     common_init_result_ptr res(new common_init_result(params, model_only));
 
@@ -2414,7 +2503,9 @@ bool common_prompt_batch_decode(
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + data_spec.size();
+    const size_t tgt = device_tgt ? llama_state_seq_device_to_host(device_tgt.get(), nullptr, 0, nullptr, 0) : data_tgt.size();
+    const size_t dft = device_dft ? llama_state_seq_device_to_host(device_dft.get(), nullptr, 0, nullptr, 0) : data_dft.size();
+    return tgt + dft + data_spec.size();
 }
 
 bool common_prompt_checkpoint::empty() const {
@@ -2430,6 +2521,8 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+    device_tgt.reset();
+    device_dft.reset();
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2449,11 +2542,23 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    if (device_tgt) { flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE; }
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    size_t n = device_tgt
+        ? llama_state_seq_device_get(ctx, data_tgt.data(), ckpt_size, seq_id, flags, device_tgt.get())
+        : llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    if (n == 0 && device_tgt) {
+        COM_WRN("%s: device checkpoint refused; preserving checkpoint in host memory\n", __func__);
+        device_tgt.reset();
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        const size_t host_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+        data_tgt.resize(host_size);
+        n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), host_size, seq_id, flags);
+        if (n == host_size) { return; }
+    }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2467,11 +2572,23 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    if (device_dft) { flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE; }
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    size_t n = device_dft
+        ? llama_state_seq_device_get(ctx, data_dft.data(), ckpt_size, seq_id, flags, device_dft.get())
+        : llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    if (n == 0 && device_dft) {
+        COM_WRN("%s: device checkpoint refused; preserving checkpoint in host memory\n", __func__);
+        device_dft.reset();
+        flags &= ~LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        const size_t host_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+        data_dft.resize(host_size);
+        n = llama_state_seq_get_data_ext(ctx, data_dft.data(), host_size, seq_id, flags);
+        if (n == host_size) { return; }
+    }
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2489,7 +2606,9 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+    const size_t n = device_tgt
+        ? llama_state_seq_device_set(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags, device_tgt.get())
+        : llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     return n == data_tgt.size();
 }
 
@@ -2505,15 +2624,35 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
-    const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+    const size_t n = device_dft
+        ? llama_state_seq_device_set(ctx, data_dft.data(), data_dft.size(), seq_id, flags, device_dft.get())
+        : llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     return n == data_dft.size();
+}
+
+static void common_checkpoint_to_host(common_state_data & data, std::shared_ptr<llama_state_seq_device> & device) {
+    if (!device) { return; }
+    const size_t size = llama_state_seq_device_to_host(device.get(), data.data(), data.size(), nullptr, 0);
+    common_state_data host(size);
+    if (llama_state_seq_device_to_host(device.get(), data.data(), data.size(), host.data(), host.size()) != size) {
+        GGML_ABORT("device checkpoint materialization failed\n");
+    }
+    data = std::move(host);
+    device.reset();
+}
+
+void common_prompt_checkpoint::to_host() {
+    common_checkpoint_to_host(data_tgt, device_tgt);
+    common_checkpoint_to_host(data_dft, device_dft);
 }
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    device_tgt.reset();
 }
 
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+    device_dft.reset();
 }

@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-adaptive.h"
 
 #include <algorithm>
 #include <cassert>
@@ -19,6 +20,7 @@
 #include <map>
 #include <random>
 #include <cinttypes>
+#include <cstdlib>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -26,6 +28,22 @@
 #define SPC_WRN(fmt, ...) LOG_WRN("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
+// o caminho "target h rows no device" (llama_set_embeddings_nextn_dev + ctx_state_src)
+// mantém as linhas de h_nextn no buffer do device, e o draft as lê com get_rows. Ele não é
+// seguro quando o KV de atenção do alvo tem mais de uma stream (`--parallel N` com
+// `kv-unified = false`, o caso do [mi50-35b] em produção): o primeiro decode depois de um
+// prefill de 32k aborta em `k_set_rows` (dst h_nextn_dev, F32/I64) com
+// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION. Medido na revisão anterior: com uma stream (27B,
+// `kv-unified = true`) não há crash; sem o caminho do device (linhas no host) também não.
+static uint32_t target_attention_streams(llama_context * ctx) {
+    llama_memory_resource_capacity cap = {};
+    if (llama_memory_get_resource_capacity(llama_get_memory(ctx), 0, &cap, sizeof(cap)) &&
+        cap.attention_known && cap.attention_stream_count > 0) {
+        return cap.attention_stream_count;
+    }
+    return 1;
+}
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -210,9 +228,12 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    virtual void accept_partial(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual void clear_state(llama_seq_id /*seq_id*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -976,6 +997,11 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
     }
+    void clear_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        pending_pos_last[seq_id] = -1;
+        std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
+    }
 };
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
@@ -1523,6 +1549,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+static bool mtp_adaptive_up_enabled() {
+    const char * e = std::getenv("LLAMA_MTP_ADAPTIVE_UP");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
+static int mtp_adaptive_env_int(const char * name, int def) {
+    const char * e = std::getenv(name);
+    if (!e || !*e) {
+        return def;
+    }
+    return std::atoi(e);
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1560,6 +1599,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    bool adaptive = false;
+    int  adaptive_nmin = 3;
+    std::vector<int> n_cap;   // [n_seq]
+    std::vector<int> n_last;  // [n_seq]
+    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq]
 
     // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
     // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
@@ -1634,6 +1679,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        n_cap.assign(n_seq, this->params.n_max);
+        n_last.assign(n_seq, 0);
+        adaptive = mtp_adaptive_up_enabled();
+        adaptive_nmin = std::max(1, mtp_adaptive_env_int("LLAMA_MTP_ADAPTIVE_UP_NMIN", 3));
+        if (adaptive) {
+            adaptive_ctrl.resize(n_seq);
+            for (uint32_t s = 0; s < n_seq; ++s) {
+                adaptive_ctrl[s].reset(this->params.n_max, adaptive_nmin);
+            }
+            SPC_INF("adaptive draft depth: cap=%d floor=%d\n",
+                    this->params.n_max, adaptive_nmin);
+        }
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1647,8 +1705,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_row0.assign(n_seq, -1);
 
         // shared memory and chained heads keep the host rows
+        // desligou o caminho do device com o KV do alvo em mais de uma stream porque ele
+        // derrubava a engine. A revisão anterior localizou a dependência que faltava no reuso de grafo
+        // (grafo de prefill estacionado e revivido no galloc compartilhado reaproveita um plano
+        // de endereços que outro grafo em voo ainda usa) e o caminho volta a ser o default; o
+        // escopo do cache está em llama-context.cpp (cache-scope). LLAMA_MTP_DEV_ROWS=0/1
+        // continua forçando (kill switch comportamental para A/B e rollback).
+        const uint32_t n_stream_tgt = target_attention_streams(ctx_tgt);
+        const char * dev_rows_env = getenv("LLAMA_MTP_DEV_ROWS");
+        const bool allow_dev_rows = dev_rows_env ? (atoi(dev_rows_env) != 0) : true;
+        if (!is_mem_shared && !chain_heads && !allow_dev_rows) {
+            SPC_INF("target h rows stay on the host: LLAMA_MTP_DEV_ROWS=0 (%u target streams) (t2101)\n",
+                    (unsigned) n_stream_tgt);
+        }
         if (!is_mem_shared && !chain_heads) {
-            dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
+            dev_rows = allow_dev_rows &&
+                llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_ctx_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
@@ -1678,6 +1750,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        if (adaptive) {
+            adaptive_ctrl[seq_id].reset(this->params.n_max, adaptive_nmin);
+        }
+        n_last[seq_id] = 0;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1859,6 +1936,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            n_cap[seq_id] = adaptive ? adaptive_ctrl[seq_id].n_cur : this->params.n_max;
+            if (dp.n_max > 0 && dp.n_max < n_cap[seq_id]) {
+                n_cap[seq_id] = dp.n_max;
+            }
+            n_last[seq_id] = 0;
+
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
@@ -1956,7 +2039,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_cap[seq_id] <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2006,12 +2089,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
             }
+            n_last[seq_id] = (int) dp.result->size();
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void adaptive_feedback(llama_seq_id seq_id, uint16_t n_accepted) {
+        if (!adaptive || n_last[seq_id] <= 0) {
+            return;
+        }
+
+        const int depth_before = adaptive_ctrl[seq_id].n_cur;
+        adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, adaptive_nmin);
+        if (adaptive_ctrl[seq_id].n_cur != depth_before) {
+            SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
+                    (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
+        }
+
+        n_last[seq_id] = 0;
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (!is_other) {
+            adaptive_feedback(seq_id, n_accepted);
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
@@ -2029,6 +2132,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    void accept_partial(llama_seq_id seq_id, uint16_t n_accepted) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        adaptive_feedback(seq_id, n_accepted);
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
@@ -2052,6 +2163,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+    }
+    void clear_state(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) return;
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        // Single-head MTP (Qwen) never allocates chain_h. Erase/restore must
+        // clear the optional carry without indexing an absent chained-head row.
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+        n_last[seq_id] = 0;
     }
 };
 
@@ -3187,6 +3310,17 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
+void common_speculative_accept_partial(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+
+    if (impl == nullptr) {
+        GGML_ASSERT(n_accepted == 0);
+        return;
+    }
+
+    impl->accept_partial(seq_id, n_accepted);
+}
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
@@ -3246,6 +3380,11 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+void common_speculative_clear_state(common_speculative * spec, llama_seq_id seq_id) {
+    if (!spec) return;
+    for (auto & impl : spec->impls) impl->clear_state(seq_id);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

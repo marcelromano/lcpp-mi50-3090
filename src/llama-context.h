@@ -42,6 +42,88 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// Metadata/tensor order permits lossless materialization into the ordinary host format.
+struct llama_device_segment {
+    ggml_backend_buffer_type_t buft; // nullptr = metadata
+    size_t offset;
+    size_t size;
+};
+struct llama_device_copy_event {
+    ggml_backend_dev_t   dev          = nullptr;
+    ggml_backend_t       copy_backend = nullptr;
+    ggml_backend_event_t event        = nullptr;
+    bool                 pending      = false;
+
+    llama_device_copy_event() = default;
+    llama_device_copy_event(const llama_device_copy_event &) = delete;
+    llama_device_copy_event & operator=(const llama_device_copy_event &) = delete;
+    llama_device_copy_event(llama_device_copy_event && other) noexcept
+        : dev(other.dev), copy_backend(other.copy_backend), event(other.event), pending(other.pending) {
+        other.dev = nullptr;
+        other.copy_backend = nullptr;
+        other.event = nullptr;
+        other.pending = false;
+    }
+    llama_device_copy_event & operator=(llama_device_copy_event && other) noexcept {
+        if (this != &other) {
+            destroy();
+            dev = other.dev;
+            copy_backend = other.copy_backend;
+            event = other.event;
+            pending = other.pending;
+            other.dev = nullptr;
+            other.copy_backend = nullptr;
+            other.event = nullptr;
+            other.pending = false;
+        }
+        return *this;
+    }
+    ~llama_device_copy_event() {
+        destroy();
+    }
+    void wait_host() {
+        if (pending && event) {
+            ggml_backend_event_synchronize(event);
+            pending = false;
+        }
+    }
+    void destroy() {
+        wait_host();
+        if (event) {
+            ggml_backend_event_free(event);
+            event = nullptr;
+        }
+        dev = nullptr;
+        copy_backend = nullptr;
+    }
+};
+struct llama_device_checkpoint : public std::enable_shared_from_this<llama_device_checkpoint> {
+    llama_memory_buffers buffers;
+    std::vector<llama_device_segment> segments;
+    std::vector<llama_device_copy_event> copy_events;
+    // layout do armazenamento — 0 = legado (byte-stream lógico espelhado em um buffer
+    // Meta por tipo de buffer), 2 = por dispositivo (peças contíguas no buffer de cada GPU).
+    int      layout     = 0;
+    uint64_t layout_sig = 0;
+
+    void wait_host() {
+        for (auto & ev : copy_events) {
+            ev.wait_host();
+        }
+    }
+
+    void clear_pending_for(ggml_backend_t copy_backend) {
+        for (auto & ev : copy_events) {
+            if (ev.copy_backend == copy_backend) {
+                ev.pending = false;
+            }
+        }
+    }
+};
+struct llama_state_seq_device {
+    std::shared_ptr<llama_device_checkpoint> storage;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -177,8 +259,11 @@ struct llama_context {
 
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
-    size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
-    size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+    size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_device_checkpoint * device = nullptr, bool async_device = false);
+    size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_device_checkpoint * device = nullptr);
+    llama_state_seq_device * state_seq_device_acquire(llama_seq_id seq_id, size_t limit);
+    void wait_pending_device_ckpt_war_gpu();
+    void wait_pending_device_ckpt_war_host();
 
     bool state_load_file(
             const char * filepath,
@@ -196,7 +281,13 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                llama_state_seq_limits * limits = nullptr);
+
+    uint64_t state_restore_tensor_capacity() const;
+    uint64_t state_restore_file_capacity(llama_seq_id seq) const;
+    size_t state_seq_load_file_bounded(llama_seq_id seq,const char * path,llama_token * tokens,
+        size_t capacity,size_t * count,llama_state_seq_limits * limits);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
@@ -251,6 +342,11 @@ private:
 
     void output_reorder();
 
+    // Preserve full-vocabulary public logits even for a compact FastMTP head.
+    void extract_logits(ggml_tensor * tensor, float * dst, size_t n_rows);
+    std::vector<int32_t> draft_to_target;
+    std::vector<float> draft_logits;
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -287,6 +383,8 @@ public:
 
 private:
     llm_graph_result * get_gf_res_prev();
+    void               gf_cache_clear();
+    void               gf_cache_reset_results();
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -450,8 +548,23 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Active graph result plus cached (graph, sched) slots sharing the scheduler's compute vbuffers.
+    struct gf_cache_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+        uint64_t buf_epoch = 0;
+        uint64_t last_used = 0;
+    };
+    llm_graph_result_ptr gf_res_active;
+    uint64_t active_buf_epoch = 0;
+    uint64_t gf_cache_tick    = 0;
+    int32_t  gf_active_ntok   = 0; // n_tokens of the graph currently active (cache eligibility)
+    int32_t  n_slot_hits      = 0;
+    int32_t  n_slot_misses    = 0;
+    int32_t  n_pad_applied    = 0;
+    int32_t  n_pad_fallback   = 0;
+    int32_t  n_cache_skip     = 0; // ubatches above the gf_cache size limit, rebuilt in place
+    std::vector<gf_cache_slot> gf_cache;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -488,6 +601,22 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+    // The pool owns one reference; live checkpoint leases prevent reuse, including RAM-cache copies.
+    std::map<llama_seq_id, std::vector<std::shared_ptr<llama_device_checkpoint>>> device_ckpt_pool;
+
+    struct device_ckpt_stream {
+        ggml_backend_t       copy_backend  = nullptr;
+        ggml_backend_event_t compute_ready = nullptr;
+        bool                 has_pending   = false;
+    };
+    struct device_ckpt_war {
+        ggml_backend_t                       compute_backend = nullptr;
+        std::weak_ptr<llama_device_checkpoint> ckpt;
+    };
+    std::map<ggml_backend_t, device_ckpt_stream> device_ckpt_streams;
+    std::vector<device_ckpt_war>                 pending_device_ckpt_war;
+
+    ggml_backend_t ensure_device_ckpt_copy_stream(ggml_backend_t compute_backend, ggml_backend_event_t * ready_event_out);
 
     bool has_evaluated_once = false;
 
