@@ -162,6 +162,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) batched copy of host tensors to the backend, enqueued on the compute stream in order
+        // and before the graph launch, without a host-side synchronization. The backend must keep its own
+        // copy of the source data until the transfer executes. Returns true if all copies were enqueued,
+        // false if unsupported and nothing was enqueued.
+        bool (*cpy_tensor_n_async)(ggml_backend_t backend, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
     };
 
     struct ggml_backend {

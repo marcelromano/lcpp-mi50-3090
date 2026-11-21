@@ -465,6 +465,7 @@ struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    bool is_view;
 };
 
 struct leaf_alloc {
@@ -476,9 +477,17 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+struct ggml_vbuffer_pool {
+    struct vbuffer ** buffers; // [n_buffers]
+    int n_buffers;
+    uint64_t epoch;
+    int refcount;
+};
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
-    struct vbuffer ** buffers; // [n_buffers]
+    struct vbuffer ** buffers; // aliases pool->buffers [n_buffers]
+    struct ggml_vbuffer_pool * pool;
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
@@ -492,22 +501,34 @@ struct ggml_gallocr {
     int n_leafs;
 };
 
-ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+static ggml_gallocr_t ggml_gallocr_new_with_pool(
+        ggml_backend_buffer_type_t * bufts, int n_bufs, struct ggml_vbuffer_pool * pool) {
     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
     GGML_ASSERT(galloc != NULL);
 
     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
     GGML_ASSERT(galloc->bufts != NULL);
 
-    galloc->buffers = calloc(n_bufs, sizeof(struct vbuffer *));
-    GGML_ASSERT(galloc->buffers != NULL);
+    if (pool == NULL) {
+        pool = (struct ggml_vbuffer_pool *)calloc(1, sizeof(struct ggml_vbuffer_pool));
+        GGML_ASSERT(pool != NULL);
+        pool->buffers = calloc(n_bufs, sizeof(struct vbuffer *));
+        GGML_ASSERT(pool->buffers != NULL);
+        pool->n_buffers = n_bufs;
+        pool->epoch = 0;
+        pool->refcount = 1;
+    } else {
+        GGML_ASSERT(pool->n_buffers == n_bufs);
+        pool->refcount++;
+    }
+    galloc->pool = pool;
+    galloc->buffers = pool->buffers;
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
-        galloc->buffers[i] = NULL;
 
         // check if the same buffer type is used multiple times and reuse the same allocator
         for (int j = 0; j < i; j++) {
@@ -528,6 +549,20 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     return galloc;
 }
 
+ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+    return ggml_gallocr_new_with_pool(bufts, n_bufs, NULL);
+}
+
+ggml_gallocr_t ggml_gallocr_new_shared(ggml_gallocr_t src) {
+    GGML_ASSERT(src != NULL && src->pool != NULL);
+    return ggml_gallocr_new_with_pool(src->bufts, src->n_buffers, src->pool);
+}
+
+uint64_t ggml_gallocr_get_buffer_epoch(ggml_gallocr_t galloc) {
+    GGML_ASSERT(galloc != NULL && galloc->pool != NULL);
+    return galloc->pool->epoch;
+}
+
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
@@ -537,20 +572,29 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
         return;
     }
 
-    for (int i = 0; i < galloc->n_buffers; i++) {
-        if (galloc->buffers != NULL) {
-            // skip if already freed
-            bool freed = false;
-            for (int j = 0; j < i; j++) {
-                if (galloc->buffers[j] == galloc->buffers[i]) {
-                    freed = true;
-                    break;
+    if (galloc->pool != NULL) {
+        galloc->pool->refcount--;
+        if (galloc->pool->refcount == 0) {
+            for (int i = 0; i < galloc->pool->n_buffers; i++) {
+                if (galloc->pool->buffers != NULL) {
+                    bool freed = false;
+                    for (int j = 0; j < i; j++) {
+                        if (galloc->pool->buffers[j] == galloc->pool->buffers[i]) {
+                            freed = true;
+                            break;
+                        }
+                    }
+                    if (!freed) {
+                        ggml_vbuffer_free(galloc->pool->buffers[i]);
+                    }
                 }
             }
-            if (!freed) {
-                ggml_vbuffer_free(galloc->buffers[i]);
-            }
+            free(galloc->pool->buffers);
+            free(galloc->pool);
         }
+    }
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buf_tallocs != NULL) {
             // skip if already freed
             bool freed = false;
@@ -569,7 +613,6 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     ggml_hash_set_free(&galloc->hash_set);
     free(galloc->hash_values);
     free(galloc->bufts);
-    free(galloc->buffers);
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
@@ -858,11 +901,13 @@ static bool ggml_gallocr_reserve_n_impl(
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
             node_alloc->dst.size_max = 0;
+            node_alloc->dst.is_view = (node->view_src != NULL && node->buffer == NULL);
         } else {
             struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
             node_alloc->dst.buffer_id = hn->buffer_id;
             node_alloc->dst.addr = hn->addr;
             node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
+            node_alloc->dst.is_view = false;
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
@@ -870,11 +915,13 @@ static bool ggml_gallocr_reserve_n_impl(
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
                 node_alloc->src[j].size_max = 0;
+                node_alloc->src[j].is_view = (src != NULL && src->view_src != NULL && src->buffer == NULL);
             } else {
                 struct hash_node * hn = ggml_gallocr_hash_get(galloc, src);
                 node_alloc->src[j].buffer_id = hn->buffer_id;
                 node_alloc->src[j].addr = hn->addr;
                 node_alloc->src[j].size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], src);
+                node_alloc->src[j].is_view = false;
             }
         }
     }
@@ -891,10 +938,12 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
             galloc->leaf_allocs[i].leaf.size_max = 0;
+            galloc->leaf_allocs[i].leaf.is_view = (leaf->view_src != NULL && leaf->buffer == NULL);
         } else {
             galloc->leaf_allocs[i].leaf.buffer_id = hn->buffer_id;
             galloc->leaf_allocs[i].leaf.addr = hn->addr;
             galloc->leaf_allocs[i].leaf.size_max = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], leaf);
+            galloc->leaf_allocs[i].leaf.is_view = false;
         }
     }
 
@@ -920,6 +969,9 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            if (galloc->pool != NULL && (galloc->buffers[i] != NULL || !no_alloc)) {
+                galloc->pool->epoch++;
+            }
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
@@ -1092,6 +1144,42 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+bool ggml_gallocr_rebind_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (galloc == NULL || graph == NULL) {
+        return false;
+    }
+    if (galloc->n_nodes != graph->n_nodes || galloc->n_leafs != graph->n_leafs) {
+        return false;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        const struct tensor_alloc * ta = &galloc->leaf_allocs[i].leaf;
+        if (ta->buffer_id >= 0 || ta->is_view) {
+            leaf->data = NULL;
+            leaf->buffer = NULL;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        const struct node_alloc * na = &galloc->node_allocs[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+            if (na->src[j].buffer_id >= 0 || na->src[j].is_view) {
+                src->data = NULL;
+                src->buffer = NULL;
+            }
+        }
+        if (na->dst.buffer_id >= 0 || na->dst.is_view) {
+            node->data = NULL;
+            node->buffer = NULL;
+        }
+    }
+    return ggml_gallocr_alloc_graph(galloc, graph);
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
