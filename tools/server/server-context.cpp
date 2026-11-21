@@ -2317,6 +2317,14 @@ private:
                 }
 
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // with a unified KV cache the idle-slot logic clears every idle slot on a
+                // new task and keeps its state in the RAM prompt cache. An empty slot has nothing
+                // to lose, so let the prompt cache restore the best matching state instead of a
+                // full re-evaluation just because the slot was addressed by id.
+                if (ret->prompt.tokens.empty() && task.params.cache_prompt) {
+                    update_cache = true;
+                }
             }
         }
 
